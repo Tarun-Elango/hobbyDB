@@ -1,0 +1,57 @@
+Stage 1: Give nodes shared Raft information
+Add a few things each node needs to remember:
+- Which election term it is in. A term is like an election round.
+- Which node it voted for in that round.
+- Which log entries are committed and ready to apply.
+After this stage: nodes have the information they need to take part in Raft.
+
+Stage 2: Save important information across restarts
+Update the WAL so each saved command includes its term. Save the current term and vote too.
+Why: if a node restarts, it must remember enough to avoid voting twice in one round or forgetting the history of its log.
+
+Stage 3: Make every node start as a follower
+When a node starts, it loads its saved data, then waits for messages from its peers. No node is manually marked as leader.
+After this stage: startup is ready for automatic elections.
+
+Stage 4: Hold an election when the leader seems missing
+A follower waits for a random amount of time. If it hasn’t heard from a leader, it starts an election and asks the other nodes to vote for it.
+If a candidate gets votes from more than half the cluster, it becomes leader.
+Example: in a 3-node cluster, a candidate needs 2 votes.
+
+Stage 5: Let nodes send Raft messages to each other
+Extend the existing peer network so every node can send and receive messages for elections and log updates.
+After this stage: nodes can ask for votes and tell peers who the leader is.
+
+Stage 6: Have the leader copy new writes to peers
+When the leader receives a write, it adds the command to its log and sends it to the other nodes. If a peer’s log doesn’t match, the leader backs up and tries again from an earlier point.
+After this stage: nodes can get their logs back in sync.
+
+Stage 7: Decide when a write is safe
+The leader waits until a majority of nodes have the write in their logs. Then it marks that write as committed.
+Why: if one node fails, the other nodes still have enough information to keep the committed write.
+
+Stage 8: Apply committed writes to the key-value store
+Only committed writes change the visible key-value data. Apply them in order, one at a time.
+After this stage: a client gets success only after the write is safely stored by a majority and applied.
+
+Stage 9: Connect the client server to Raft
+Change the client write path:
+1. Client sends a write to a node.
+2. If that node is leader, it proposes the write to Raft.
+3. Raft copies it to peers and waits for a majority.
+4. The node applies the committed write and replies success.
+5. If the node isn’t leader, it tells the client who the leader is, if known.
+
+Stage 10: Check the cluster’s behavior
+Check that elections work, writes wait for a majority, failed nodes can rejoin, and restarted nodes recover their saved data.
+
+
+Benchmark:
+- deploy to ec2
+- write throughput
+- write latency by cluster size
+- payload size
+- read throughput
+- follower catchup time
+- leader failure recovery
+- mixed read/write workload
