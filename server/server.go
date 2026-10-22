@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"kvStore/proto"
+	"kvStore/raft"
 	"kvStore/replication"
 	"kvStore/store"
 	"kvStore/wal"
@@ -16,8 +17,7 @@ import (
 	"time"
 )
 
-// reusable code
-// that defines type Server struct{...} and its methods
+// config from user input, to set the server state like role, addr
 type Config struct {
 	Role       replication.Role
 	LeaderAddr string
@@ -25,8 +25,10 @@ type Config struct {
 
 	LeaderReplicator   *replication.Leader
 	FollowerReplicator *replication.Follower
+	RaftNode           *raft.Node
 }
 
+// the actual running server object with the store
 // server will keep the store, contructor will create the struct,
 // prevents every function receiving the store
 type Server struct {
@@ -51,6 +53,8 @@ type Server struct {
 	handlers     sync.WaitGroup // lets shutdown() wait for all goroutines to finish
 	shutDownOnce sync.Once      // helps ensure shutdown only happens once, sync.once guarantees once execution - used in shutdown
 	logCloseOnce sync.Once
+
+	raftNode *raft.Node
 }
 
 // constructor, takes store, returns server pointer
@@ -80,6 +84,7 @@ func NewWithConfig(
 		leaderReplicator:   cfg.LeaderReplicator,
 		followerReplicator: cfg.FollowerReplicator,
 		connections:        make(map[net.Conn]struct{}),
+		raftNode:           cfg.RaftNode,
 	}
 }
 

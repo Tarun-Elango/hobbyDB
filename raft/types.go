@@ -1,6 +1,9 @@
 package raft
 
-import "kvStore/proto"
+import (
+	"kvStore/proto"
+	"sync"
+)
 
 type Role uint8
 
@@ -16,18 +19,52 @@ type LogEntry struct {
 	Command proto.Command
 }
 
+// actual state
 type Node struct {
+	mu sync.RWMutex
+
 	ID string
 
 	Role        Role
 	CurrentTerm uint64
 	VotedFor    string
-	LeaderId    string
+	LeaderID    string
 
-	CommitIndex uint64 // highest index raft considers safely commited
-	LastApplied uint64 // highest this node commited
+	CommitIndex uint64 // highest log index known to be committed
+	LastApplied uint64 // highest committed index applied to the key-value store
 
 	Log []LogEntry
+}
+
+// read only copy, thread safe
+type Snapshot struct {
+	ID          string
+	Role        Role
+	CurrentTerm uint64
+	VotedFor    string
+	LeaderID    string
+	CommitIndex uint64
+	LastApplied uint64
+	Log         []LogEntry
+}
+
+// copy nodes current state and return as snapshot
+func (n *Node) Snapshot() Snapshot {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	logCopy := append([]LogEntry(nil), n.Log...) // copies log entires to a new slice, change to orignal keep this unaffected
+
+	return Snapshot{
+		ID:          n.ID,
+		Role:        n.Role,
+		CurrentTerm: n.CurrentTerm,
+		VotedFor:    n.VotedFor,
+		LeaderID:    n.LeaderID,
+		CommitIndex: n.CommitIndex,
+		LastApplied: n.LastApplied,
+		Log:         logCopy,
+	}
+
 }
 
 func NewNode(id string) *Node {

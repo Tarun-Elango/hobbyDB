@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"kvStore/proto"
+	"kvStore/raft"
 	"kvStore/replication"
 	"kvStore/server"
 	"kvStore/store"
@@ -177,6 +178,8 @@ func runLeader(ctx context.Context, opts options) error {
 	// once leader created and its memory updated
 	// create a server to listen
 
+	raftNode := raft.NewNode(opts.nodeID)
+
 	srv := server.NewWithConfig(
 		st,
 		log,
@@ -184,6 +187,7 @@ func runLeader(ctx context.Context, opts options) error {
 			Role:             replication.RoleLeader,
 			NextIndex:        log.LastIndex() + 1,
 			LeaderReplicator: leaderReplicator,
+			RaftNode:         raftNode,
 		},
 	)
 
@@ -250,6 +254,7 @@ func runFollower(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("create replication server: %w", err)
 	}
+	raftNode := raft.NewNode(opts.nodeID)
 
 	fmt.Printf("Creating follower server \n")
 	srv := server.NewWithConfig(
@@ -259,6 +264,7 @@ func runFollower(ctx context.Context, opts options) error {
 			Role:               replication.RoleFollower,
 			LeaderAddr:         opts.leaderAddr,
 			FollowerReplicator: follower,
+			RaftNode:           raftNode,
 		},
 	)
 
