@@ -20,8 +20,8 @@ const (
 const maxAppendPayloadSize = maxReplicationFrame - 2 // protocol byte + message-type byte
 
 func encodedReplicationEntrySize(entry Entry) int {
-	// index + op + key length + key + value length + value
-	return 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+	// index + term + op + key length + key + value length + value
+	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
 }
 
 // each follower state( stored in lader)

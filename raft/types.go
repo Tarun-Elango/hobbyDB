@@ -23,7 +23,8 @@ type LogEntry struct {
 type Node struct {
 	mu sync.RWMutex
 
-	ID string
+	ID        string
+	statePath string
 
 	Role        Role
 	CurrentTerm uint64

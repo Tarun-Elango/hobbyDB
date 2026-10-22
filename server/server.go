@@ -277,8 +277,14 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 		}, nil
 	}
 
+	var term uint64
+	if s.raftNode != nil {
+		term = s.raftNode.Snapshot().CurrentTerm // current term from snapshot
+	}
+
 	entry := replication.Entry{
 		Index: s.nextIndex,
+		Term:  term,
 		Command: proto.Command{
 			Op:    cmd.Op,
 			Key:   append([]byte(nil), cmd.Key...),
@@ -329,6 +335,7 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 func recordFromEntry(entry replication.Entry) (wal.Record, error) {
 	record := wal.Record{
 		Index: entry.Index,
+		Term:  entry.Term, // need to make it through both leader and followers wal conversion
 		Key:   append([]byte(nil), entry.Command.Key...),
 		Value: append([]byte(nil), entry.Command.Value...),
 	}

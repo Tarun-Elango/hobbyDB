@@ -13,7 +13,7 @@ import (
 
 // Identifies the WAL format and version so incompatible or legacy files can be rejected safely.
 // bytes added to top of file as a indicator
-var walHeader = []byte{'K', 'V', 'W', 'L', 1}
+var walHeader = []byte{'K', 'V', 'W', 'L', 2} // 2 -> version
 
 var ErrUnsupportedFormat = errors.New(
 	"wal: unsupported format; migrate or delete the existing WAL",

@@ -18,6 +18,7 @@ const (
 
 type Record struct {
 	Index uint64 // wal payload needs index
+	Term  uint64 // raft term
 	Op    byte
 	Key   []byte
 	Value []byte
@@ -30,9 +31,8 @@ const (
 
 // maxRecordLen guards against a corrupted or bogus length prefix causing
 // a huge allocation. Generous upper bound on payload size:
-// 1 (op) + 4 (keyLen) + MaxKeyLen + 4 (valLen) + MaxValueLen
-// 8 -> index, 64 bits = 8 bytes
-const maxRecordLen = 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen
+// 8 (index) + 8 (term) + 1 (op) + 4 (keyLen) + MaxKeyLen + 4 (valLen) + MaxValueLen
+const maxRecordLen = 8 + 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen
 
 var (
 	ErrUnknownOp        = errors.New("wal: unknown operation")
@@ -81,6 +81,7 @@ func encodePayload(rec Record) []byte {
 	buf := new(bytes.Buffer)
 
 	_ = writeUint64(buf, rec.Index)
+	_ = writeUint64(buf, rec.Term) // raft term
 	buf.WriteByte(byte(rec.Op))
 	_ = writeUint32(buf, uint32(len(rec.Key)))
 	buf.Write(rec.Key)
@@ -140,12 +141,17 @@ func DecodeRecord(r io.Reader) (Record, error) {
 // already-fully-read, already-checksum-verified byte slice.
 func decodePayload(payload []byte) (Record, error) {
 	r := bytes.NewReader(payload)
-	index, err := readUint64(r)
+	index, err := readUint64(r) // index
 	if err != nil {
 		return Record{}, ErrIncompleteRecord
 	}
 	if index == 0 {
 		return Record{}, ErrInvalidIndex
+	}
+
+	term, err := readUint64(r) // raft term
+	if err != nil {
+		return Record{}, ErrIncompleteRecord
 	}
 
 	opByte, err := r.ReadByte()
@@ -183,7 +189,7 @@ func decodePayload(payload []byte) (Record, error) {
 	if _, err := io.ReadFull(r, value); err != nil {
 		return Record{}, ErrIncompleteRecord
 	}
-	return Record{Index: index, Op: byte(op), Key: key, Value: value}, nil
+	return Record{Index: index, Term: term, Op: byte(op), Key: key, Value: value}, nil
 
 }
 

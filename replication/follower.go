@@ -350,6 +350,7 @@ func validateCommand(cmd proto.Command) error {
 func entryToRecord(entry Entry) wal.Record {
 	record := wal.Record{
 		Index: entry.Index,
+		Term:  entry.Term,
 		Key:   append([]byte(nil), entry.Command.Key...),
 		Value: append([]byte(nil), entry.Command.Value...),
 	}
@@ -378,6 +379,7 @@ func recordToEntry(record wal.Record) (Entry, error) {
 
 	return Entry{
 		Index: record.Index,
+		Term:  record.Term,
 		Command: proto.Command{
 			Op:    op,
 			Key:   append([]byte(nil), record.Key...),
@@ -401,6 +403,7 @@ func applyCommand(
 func cloneEntry(entry Entry) Entry {
 	return Entry{
 		Index: entry.Index,
+		Term:  entry.Term,
 		Command: proto.Command{
 			Op:    entry.Command.Op,
 			Key:   append([]byte(nil), entry.Command.Key...),
@@ -411,6 +414,7 @@ func cloneEntry(entry Entry) Entry {
 
 func sameEntry(a, b Entry) bool {
 	return a.Index == b.Index &&
+		a.Term == b.Term &&
 		a.Command.Op == b.Command.Op &&
 		bytes.Equal(a.Command.Key, b.Command.Key) &&
 		bytes.Equal(a.Command.Value, b.Command.Value)

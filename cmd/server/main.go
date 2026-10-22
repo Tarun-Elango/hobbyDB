@@ -178,7 +178,10 @@ func runLeader(ctx context.Context, opts options) error {
 	// once leader created and its memory updated
 	// create a server to listen
 
-	raftNode := raft.NewNode(opts.nodeID)
+	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
+	if err != nil {
+		return fmt.Errorf("open raft node: %w", err)
+	}
 
 	srv := server.NewWithConfig(
 		st,
@@ -254,7 +257,10 @@ func runFollower(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("create replication server: %w", err)
 	}
-	raftNode := raft.NewNode(opts.nodeID)
+	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
+	if err != nil {
+		return fmt.Errorf("open raft node: %w", err)
+	}
 
 	fmt.Printf("Creating follower server \n")
 	srv := server.NewWithConfig(
@@ -354,6 +360,7 @@ func entryFromRecord(rec wal.Record) (replication.Entry, error) {
 
 	return replication.Entry{
 		Index: rec.Index,
+		Term:  rec.Term,
 		Command: proto.Command{
 			Op:    op,
 			Key:   append([]byte(nil), rec.Key...),

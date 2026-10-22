@@ -29,8 +29,8 @@ const maxAppendRequestPayload = maxReplicationFrame - 2 // max payload 64MiB -2 
 // 1 byte protocol version + 1 byte message type
 
 func encodedEntrySize(entry Entry) int {
-	// index + operation + key length + key + value length + value
-	return 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+	// index + term + operation + key length + key + value length + value
+	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
 }
 
 // if i append theis appendrequest, how many bytes will payload take ?, i.e checks size
@@ -411,6 +411,10 @@ func encodeEntry(w io.Writer, entry Entry) error {
 		return err
 	}
 
+	if err := writeU64(w, entry.Term); err != nil {
+		return err
+	}
+
 	if err := writeU8(w, entry.Command.Op); err != nil {
 		return err
 	}
@@ -439,6 +443,11 @@ func decodeEntry(r io.Reader) (Entry, error) {
 	index, err := readU64(r)
 	if err != nil {
 		return Entry{}, fmt.Errorf("read entry index: %w", err)
+	}
+
+	term, err := readU64(r)
+	if err != nil {
+		return Entry{}, fmt.Errorf("read entry term: %w", err)
 	}
 
 	op, err := readU8(r)
@@ -480,6 +489,7 @@ func decodeEntry(r io.Reader) (Entry, error) {
 	}
 	entry := Entry{
 		Index: index,
+		Term:  term,
 		Command: proto.Command{
 			Op:    op,
 			Key:   key,

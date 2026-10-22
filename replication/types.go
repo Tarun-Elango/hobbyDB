@@ -35,6 +35,7 @@ func (r Role) Valid() bool {
 // command SET user:1 Tarun
 type Entry struct {
 	Index   uint64
+	Term    uint64
 	Command proto.Command
 }
 
