@@ -5,8 +5,6 @@ Add a few things each node needs to remember:
 - Which log entries are committed and ready to apply.
 After this stage: nodes have the information they need to take part in Raft.
 
---- current
-
 Stage 2: Save important information across restarts
 Update the WAL so each saved command includes its term. Save the current term and vote too.
 Why: if a node restarts, it must remember enough to avoid voting twice in one round or forgetting the history of its log.
@@ -14,6 +12,8 @@ Why: if a node restarts, it must remember enough to avoid voting twice in one ro
 Stage 3: Make every node start as a follower
 When a node starts, it loads its saved data, then waits for messages from its peers. No node is manually marked as leader.
 After this stage: startup is ready for automatic elections.
+
+--- current
 
 Stage 4: Hold an election when the leader seems missing
 Define fixed cluster membership and quorum size. A follower waits for a random amount of time. If it hasn’t heard from a leader, it starts an election and asks the other nodes to vote for it.
