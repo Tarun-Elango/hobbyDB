@@ -28,14 +28,10 @@ import (
 
 type options struct {
 	nodeID          string
-	role            string
 	clientAddr      string
 	replicationAddr string
 	pprofAddr       string
 	walPath         string
-	leaderID        string
-	leaderAddr      string
-	followers       string
 }
 
 func main() {
@@ -51,39 +47,20 @@ func run() error {
 	// cmd options, user input will be assigned to theses
 
 	flag.StringVar(&opts.nodeID, "node-id", "", "unique node ID")
-	flag.StringVar(&opts.role, "role", "leader", "node role: leader or follower")
-	flag.StringVar(&opts.clientAddr, "client-addr", "", "client listen address")
-	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "follower replication listen address")
+	flag.StringVar(&opts.clientAddr, "client-addr", ":9000", "client listen address")
+	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "peer listen address")
 	flag.StringVar(&opts.pprofAddr, "pprof-addr", "", "optional pprof HTTP listen address")
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
-	flag.StringVar(&opts.leaderID, "leader-id", "", "expected leader ID; required for followers")
-	flag.StringVar(&opts.leaderAddr, "leader-addr", "", "leader client address returned to clients")
-	flag.StringVar(&opts.followers, "followers", "", "comma-separated follower replication addresses")
 	flag.Parse() // parse the cmd line arguments
 
 	if opts.nodeID == "" {
 		return fmt.Errorf("-node-id is required")
 	}
 
-	role, err := parseRole(opts.role)
-	if err != nil {
-		return err
-	}
-	if opts.clientAddr == "" {
-		if role == replication.RoleFollower {
-			opts.clientAddr = ":9010"
-		} else {
-			opts.clientAddr = ":9000"
-		}
-	}
 	if opts.walPath == "" {
-		if role == replication.RoleFollower {
-			opts.walPath = "data/follower.wal"
-		} else {
-			opts.walPath = "data/leader.wal"
-		}
+		opts.walPath = "data/" + opts.nodeID + ".wal"
 	}
-	ctx, stop := signal.NotifyContext(
+	ctx, stop := signal.NotifyContext( // get root context, signal watches for os signals
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
@@ -115,104 +92,167 @@ func run() error {
 		}()
 	}
 
-	switch role {
-	case replication.RoleLeader:
-		fmt.Printf("INFO: starting this as a leader Node\n")
-		return runLeader(ctx, opts)
-	case replication.RoleFollower:
-		fmt.Printf("INFO: starting this as a follower\n")
-		return runFollower(ctx, opts)
-	default:
-		return fmt.Errorf("ERROR: unsupported role : %s", opts.role)
-	}
+	fmt.Printf("INFO: starting this as a follower Node\n")
+	return runNode(ctx, opts)
 
 }
 
-func runLeader(ctx context.Context, opts options) error {
+func runNode(ctx context.Context, opts options) error {
 	st := store.NewStore[string, []byte]()
 
-	// open wal
-	log, err := wal.Open(opts.walPath)
+	// replay the wal into the store, nobody leader yet
+	follower, err := replication.NewFollower(opts.walPath, st, "")
 	if err != nil {
-		return fmt.Errorf("ERROR: open leader WAL: %w", err)
+		return fmt.Errorf("create follower: %w", err)
 	}
 
-	entries := make([]replication.Entry, 0)
+	runCtx, cancel := context.WithCancel(ctx) // child context for the node, so we can cancel it if needed
+	defer cancel()
 
-	// replay and apply each command from log
-	fmt.Printf("INFO: replaying leader wal while restarting\n")
-	err = log.Replay(func(rec wal.Record) error {
-		entry, err := entryFromRecord(rec)
-		if err != nil {
-			return err
-		}
-		applyCommand(st, entry.Command)
-		entries = append(entries, entry)
-		return nil
-	})
-
-	if err != nil {
-		_ = log.Close()
-		return fmt.Errorf("replay leader WAL: %w", err)
-	}
-
-	// get all followers addrs
-	followerAddrs, err := parseAddresses(opts.followers)
-	if err != nil {
-		_ = log.Close()
-		return err
-	}
-
-	// create leader
-	fmt.Printf("INFO: creating leader replicator server\n")
-	leaderReplicator, err := replication.NewLeader(
-		opts.nodeID,
-		entries,
-		followerAddrs,
+	// listen for peers, this is the "wait for messages" part
+	peerServer, err := replication.NewReplicationServer(
+		runCtx,
+		opts.replicationAddr,
+		follower,
 	)
 	if err != nil {
-		_ = log.Close()
-		return fmt.Errorf("create leader replicator: %w", err)
+		_ = follower.Close()
+		return fmt.Errorf("create replication server: %w", err)
 	}
 
-	// once leader created and its memory updated
-	// create a server to listen
-
+	// open raft node
 	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
 	if err != nil {
+		_ = follower.Close()
 		return fmt.Errorf("open raft node: %w", err)
 	}
 
 	srv := server.NewWithConfig(
 		st,
-		log,
+		nil, // wal owned by replication.Follower
 		&server.Config{
-			Role:             replication.RoleLeader,
-			NextIndex:        log.LastIndex() + 1,
-			LeaderReplicator: leaderReplicator,
-			RaftNode:         raftNode,
+			Role:               replication.RoleFollower,
+			FollowerReplicator: follower,
+			RaftNode:           raftNode,
 		},
 	)
 
+	peerErrCh := make(chan error, 1) // error channel for the peer server
+	go func() {
+		err := peerServer.Serve() // start replication server in goroutine
+		if err != nil && runCtx.Err() == nil {
+			cancel()
+		}
+		peerErrCh <- err // send error to the channel
+	}()
+
 	fmt.Printf(
-		"starting leader node=%s client=%s followers=%v\n",
+		"starting follower node=%s client=%s replication=%s term=%d\n",
 		opts.nodeID,
 		opts.clientAddr,
-		followerAddrs,
+		opts.replicationAddr,
+		raftNode.Snapshot().CurrentTerm,
 	)
-
-	// serve
-	serveErr := srv.Serve(ctx, opts.clientAddr)
-
-	leaderReplicator.Close()
-	_ = log.Close()
-
+	serveErr := srv.Serve(runCtx, opts.clientAddr) // block and serve the client requests
+	cancel()
+	_ = peerServer.Close()
+	peerErr := <-peerErrCh
+	_ = follower.Close()
 	if serveErr != nil {
-		return fmt.Errorf("leader server: %w", serveErr)
+		return fmt.Errorf("follower server: %w", serveErr)
 	}
-
+	if peerErr != nil && runCtx.Err() == nil {
+		return fmt.Errorf("replication server: %w", peerErr)
+	}
 	return nil
+
 }
+
+// func runLeader(ctx context.Context, opts options) error {
+// 	st := store.NewStore[string, []byte]()
+
+// 	// open wal
+// 	log, err := wal.Open(opts.walPath)
+// 	if err != nil {
+// 		return fmt.Errorf("ERROR: open leader WAL: %w", err)
+// 	}
+
+// 	entries := make([]replication.Entry, 0)
+
+// 	// replay and apply each command from log
+// 	fmt.Printf("INFO: replaying leader wal while restarting\n")
+// 	err = log.Replay(func(rec wal.Record) error {
+// 		entry, err := entryFromRecord(rec)
+// 		if err != nil {
+// 			return err
+// 		}
+// 		applyCommand(st, entry.Command)
+// 		entries = append(entries, entry)
+// 		return nil
+// 	})
+
+// 	if err != nil {
+// 		_ = log.Close()
+// 		return fmt.Errorf("replay leader WAL: %w", err)
+// 	}
+
+// 	// get all followers addrs
+// 	followerAddrs, err := parseAddresses(opts.followers)
+// 	if err != nil {
+// 		_ = log.Close()
+// 		return err
+// 	}
+
+// 	// create leader
+// 	fmt.Printf("INFO: creating leader replicator server\n")
+// 	leaderReplicator, err := replication.NewLeader(
+// 		opts.nodeID,
+// 		entries,
+// 		followerAddrs,
+// 	)
+// 	if err != nil {
+// 		_ = log.Close()
+// 		return fmt.Errorf("create leader replicator: %w", err)
+// 	}
+
+// 	// once leader created and its memory updated
+// 	// create a server to listen
+
+// 	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
+// 	if err != nil {
+// 		return fmt.Errorf("open raft node: %w", err)
+// 	}
+
+// 	srv := server.NewWithConfig(
+// 		st,
+// 		log,
+// 		&server.Config{
+// 			Role:             replication.RoleLeader,
+// 			NextIndex:        log.LastIndex() + 1,
+// 			LeaderReplicator: leaderReplicator,
+// 			RaftNode:         raftNode,
+// 		},
+// 	)
+
+// 	fmt.Printf(
+// 		"starting leader node=%s client=%s followers=%v\n",
+// 		opts.nodeID,
+// 		opts.clientAddr,
+// 		followerAddrs,
+// 	)
+
+// 	// serve
+// 	serveErr := srv.Serve(ctx, opts.clientAddr)
+
+// 	leaderReplicator.Close()
+// 	_ = log.Close()
+
+// 	if serveErr != nil {
+// 		return fmt.Errorf("leader server: %w", serveErr)
+// 	}
+
+// 	return nil
+// }
 
 // runFollower()
 //
@@ -224,91 +264,91 @@ func runLeader(ctx context.Context, opts options) error {
 //	                         ├─ waits for AppendRequest
 //	                         ├─ calls follower.ApplyAppend(req)
 //	                         └─ sends AppendResponse
-func runFollower(ctx context.Context, opts options) error {
-	if opts.leaderID == "" {
-		return fmt.Errorf("-leader-id is required for followers")
-	}
-	st := store.NewStore[string, []byte]() // follower store
+// func runFollower(ctx context.Context, opts options) error {
+// 	if opts.leaderID == "" {
+// 		return fmt.Errorf("-leader-id is required for followers")
+// 	}
+// 	st := store.NewStore[string, []byte]() // follower store
 
-	// opens followers wal, replays, returns follower that can apply replication request
-	follower, err := replication.NewFollower(
-		opts.walPath,
-		st,
-		opts.leaderID,
-	)
-	if err != nil {
-		return fmt.Errorf("create follower: %w", err)
-	}
+// 	// opens followers wal, replays, returns follower that can apply replication request
+// 	follower, err := replication.NewFollower(
+// 		opts.walPath,
+// 		st,
+// 		opts.leaderID,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("create follower: %w", err)
+// 	}
 
-	// ctx is process level ( sigterm, sigint)
-	// child to coordianate the followers two server
-	// flow sigterm -> ctx cancelled -> runctx cancelled -> stopped
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// 	// ctx is process level ( sigterm, sigint)
+// 	// child to coordianate the followers two server
+// 	// flow sigterm -> ctx cancelled -> runctx cancelled -> stopped
+// 	runCtx, cancel := context.WithCancel(ctx)
+// 	defer cancel()
 
-	// start replication server
+// 	// start replication server
 
-	peerServer, err := replication.NewReplicationServer(
-		runCtx,
-		opts.replicationAddr,
-		follower,
-	)
-	if err != nil {
-		_ = follower.Close()
-		return fmt.Errorf("create replication server: %w", err)
-	}
-	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
-	if err != nil {
-		return fmt.Errorf("open raft node: %w", err)
-	}
+// 	peerServer, err := replication.NewReplicationServer(
+// 		runCtx,
+// 		opts.replicationAddr,
+// 		follower,
+// 	)
+// 	if err != nil {
+// 		_ = follower.Close()
+// 		return fmt.Errorf("create replication server: %w", err)
+// 	}
+// 	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
+// 	if err != nil {
+// 		return fmt.Errorf("open raft node: %w", err)
+// 	}
 
-	fmt.Printf("Creating follower server \n")
-	srv := server.NewWithConfig(
-		st,
-		nil, // follower WAL is owned by replication.Follower
-		&server.Config{
-			Role:               replication.RoleFollower,
-			LeaderAddr:         opts.leaderAddr,
-			FollowerReplicator: follower,
-			RaftNode:           raftNode,
-		},
-	)
+// 	fmt.Printf("Creating follower server \n")
+// 	srv := server.NewWithConfig(
+// 		st,
+// 		nil, // follower WAL is owned by replication.Follower
+// 		&server.Config{
+// 			Role:               replication.RoleFollower,
+// 			LeaderAddr:         opts.leaderAddr,
+// 			FollowerReplicator: follower,
+// 			RaftNode:           raftNode,
+// 		},
+// 	)
 
-	peerErrCh := make(chan error, 1)
+// 	peerErrCh := make(chan error, 1)
 
-	// run replicator listener in goroutine
-	go func() {
-		err := peerServer.Serve()
-		if err != nil && runCtx.Err() == nil {
-			cancel()
-		}
+// 	// run replicator listener in goroutine
+// 	go func() {
+// 		err := peerServer.Serve()
+// 		if err != nil && runCtx.Err() == nil {
+// 			cancel()
+// 		}
 
-		peerErrCh <- err
-	}()
-	fmt.Printf(
-		"starting follower node=%s client=%s replication=%s leader=%s\n",
-		opts.nodeID,
-		opts.clientAddr,
-		opts.replicationAddr,
-		opts.leaderID,
-	)
+// 		peerErrCh <- err
+// 	}()
+// 	fmt.Printf(
+// 		"starting follower node=%s client=%s replication=%s leader=%s\n",
+// 		opts.nodeID,
+// 		opts.clientAddr,
+// 		opts.replicationAddr,
+// 		opts.leaderID,
+// 	)
 
-	serveErr := srv.Serve(runCtx, opts.clientAddr)
-	cancel()
-	_ = peerServer.Close()
+// 	serveErr := srv.Serve(runCtx, opts.clientAddr)
+// 	cancel()
+// 	_ = peerServer.Close()
 
-	peerErr := <-peerErrCh
-	_ = follower.Close()
-	if serveErr != nil {
-		return fmt.Errorf("follower server: %w", serveErr)
-	}
+// 	peerErr := <-peerErrCh
+// 	_ = follower.Close()
+// 	if serveErr != nil {
+// 		return fmt.Errorf("follower server: %w", serveErr)
+// 	}
 
-	if peerErr != nil && ctx.Err() == nil {
-		return fmt.Errorf("replication server: %w", peerErr)
-	}
+// 	if peerErr != nil && ctx.Err() == nil {
+// 		return fmt.Errorf("replication server: %w", peerErr)
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 func parseRole(value string) (replication.Role, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {

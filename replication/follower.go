@@ -31,10 +31,8 @@ func NewFollower(
 	if st == nil {
 		return nil, fmt.Errorf("replication: follower store cannot be nil")
 	}
-	if leaderID == "" {
-		return nil, fmt.Errorf("replication: leader ID cannot be empty")
-	}
-	if len(leaderID) > maxLeaderIDLength {
+
+	if leaderID != "" && len(leaderID) > maxLeaderIDLength {
 		return nil, fmt.Errorf(
 			"replication: leader ID is too long: got %d bytes, max %d",
 			len(leaderID),
@@ -110,7 +108,9 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		return fail(AppendErrorInvalid, fmt.Errorf("leader ID is required"))
 	}
 
-	if req.LeaderID != f.leaderID {
+	if f.leaderID == "" { // no leader id yet, remember the first leader id
+		f.leaderID = req.LeaderID
+	} else if req.LeaderID != f.leaderID {
 		return fail(AppendErrorInvalid, fmt.Errorf(
 			"unauthorized leader ID: got %q want %q",
 			req.LeaderID,

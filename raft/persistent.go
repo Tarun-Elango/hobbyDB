@@ -28,6 +28,8 @@ func OpenNode(id, path string) (*Node, error) {
 		}
 		node.CurrentTerm = state.CurrentTerm
 		node.VotedFor = state.VotedFor
+		node.Role = Follower // on restore, we are a follower
+		node.LeaderID = ""
 		return node, nil
 	}
 	if !os.IsNotExist(err) {
