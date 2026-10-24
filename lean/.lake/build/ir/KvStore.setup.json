@@ -1,0 +1,11 @@
+{"plugins": [],
+ "package": "kvstore",
+ "options": {},
+ "name": "KvStore",
+ "isModule": false,
+ "importArts":
+ {"KvStore.Proofs":
+  [["/Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/lib/lean/KvStore/Proofs.olean"]],
+  "KvStore.Map":
+  [["/Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/lib/lean/KvStore/Map.olean"]]},
+ "dynlibs": []}

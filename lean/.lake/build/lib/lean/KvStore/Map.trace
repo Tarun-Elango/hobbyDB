@@ -1,0 +1,30 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"o": ["17ed2bbff032441b.olean"],
+  "m": false,
+  "i": "f297a13bd85d4f47.ilean",
+  "c": "7e80980829e8be41.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/lib/lean /Users/tarunelango/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean /Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/KvStore/Map.lean -o /Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/lib/lean/KvStore/Map.olean -i /Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/lib/lean/KvStore/Map.ilean -c /Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/ir/KvStore/Map.c --setup /Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/.lake/build/ir/KvStore/Map.setup.json --json",
+   "level": "trace"}],
+ "inputs":
+ [["deps",
+   [["kvstore/KvStore:extraDep", [["@kvstore:extraDep", "00000000000006bb"]]],
+    ["imports", "00000000000006bb"]]],
+  ["libs",
+   [["import dynlibs", "00000000000006bb"],
+    ["package external libraries", "00000000000006bb"],
+    ["module dynlibs", "00000000000006bb"],
+    ["module plugins", "00000000000006bb"]]],
+  ["Lean 4.35.0, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc",
+   "407ce514b71d5a10"],
+  ["/Users/tarunelango/Desktop/dev/learn/go-dsa/kvStore/lean/KvStore/Map.lean",
+   "c2fea049825dd932"],
+  ["options", "00000000000006bb"],
+  ["isModule: false", "feefd2a0d3a1847e"],
+  ["Module.name: KvStore.Map", "12f7641f27ac3a47"],
+  ["Package.id?: (some kvstore)", "361f76db53a4bb4b"],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "a34f2e66238c2f68"}

@@ -1,0 +1,7 @@
+{"plugins": [],
+ "package": "kvstore",
+ "options": {},
+ "name": "KvStore.Map",
+ "isModule": false,
+ "importArts": {},
+ "dynlibs": []}

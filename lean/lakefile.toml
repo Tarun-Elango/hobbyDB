@@ -1,0 +1,6 @@
+name = "kvstore"
+version = "0.1.0"
+defaultTargets = ["KvStore"]
+
+[[lean_lib]]
+name = "KvStore"

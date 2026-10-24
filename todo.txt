@@ -13,13 +13,13 @@ Stage 3: Make every node start as a follower
 When a node starts, it loads its saved data, then waits for messages from its peers. No node is manually marked as leader.
 After this stage: startup is ready for automatic elections.
 
---- current
-
 Stage 4: Hold an election when the leader seems missing
 Define fixed cluster membership and quorum size. A follower waits for a random amount of time. If it hasn’t heard from a leader, it starts an election and asks the other nodes to vote for it.
 Grant a vote only if the candidate’s log is at least as up to date as your own.
 If a candidate gets votes from more than half the cluster, it becomes leader.
 Example: in a 3-node cluster, a candidate needs 2 votes.
+
+--- current
 
 Stage 5: Let nodes send Raft messages to each other
 Extend the existing peer network so every node can send and receive messages for elections and log updates. Handle timeouts, retries, and duplicate or delayed messages.
@@ -50,7 +50,6 @@ Check that elections work, writes wait for a majority, failed nodes can rejoin, 
 
 
 Benchmark:
-- deploy to ec2
 - write throughput
 - write latency by cluster size
 - payload size ( small, large values) check write throughput and latency
@@ -70,3 +69,6 @@ Queue concurrent writes through a single ordered writer. Collect a batch up to a
 
 Replication and WAL: Add snapshots and log compaction
 Periodically persist a consistent snapshot of the key-value state at an applied, committed log index, including its term and the metadata needed for recovery. Make the snapshot durable and publish it atomically before removing the covered WAL records or in-memory replication entries. Retain the suffix after the snapshot and recover by loading the snapshot, then replaying that suffix. Replace assumptions that log indices start at 1 or equal slice positions with a snapshot/base index. Release references to compacted entries so their copied keys and values can be garbage-collected, and reclaim unused backing storage. Add snapshot installation for followers that fall behind the retained log; they must be able to recover even after the leader has discarded their missing history. Trigger compaction using retained log bytes or entry count, and cover crash recovery, concurrent writes during snapshots, and follower catchup across the compaction boundary. This bounds retained history between compactions; the live dataset must still fit in memory.
+
+
+lean proofs:
