@@ -11,6 +11,17 @@ const (
 	electionTimeoutMax = 300 * time.Millisecond
 )
 
+type HeartbeatArgs struct {
+	Term     uint64
+	LeaderID string
+}
+
+type HeartbeatResult struct {
+	Term uint64
+}
+
+type HeartbeatRPC func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error)
+
 type RequestVoteArgs struct {
 	Term         uint64
 	CandidateID  string
