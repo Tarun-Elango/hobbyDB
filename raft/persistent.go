@@ -88,7 +88,7 @@ func writePersistentState(path string, state PersistentState) error {
 	return nil
 }
 
-// wrties and syncs state before chaning the in memory copy
+// writes and syncs state before changing the in memory copy
 // call when raft advacnes terms/records a vote
 func (n *Node) SetPersistentState(term uint64, votedFor string) error {
 	n.mu.Lock()

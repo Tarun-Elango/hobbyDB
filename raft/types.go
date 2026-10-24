@@ -35,6 +35,9 @@ type Node struct {
 	LastApplied uint64 // highest committed index applied to the key-value store
 
 	Log []LogEntry
+
+	peers         []string
+	electionReset chan struct{}
 }
 
 // read only copy, thread safe
@@ -70,8 +73,9 @@ func (n *Node) Snapshot() Snapshot {
 
 func NewNode(id string) *Node {
 	return &Node{
-		ID:   id,
-		Role: Follower,
-		Log:  make([]LogEntry, 0),
+		ID:            id,
+		Role:          Follower,
+		Log:           make([]LogEntry, 0),
+		electionReset: make(chan struct{}, 1),
 	}
 }

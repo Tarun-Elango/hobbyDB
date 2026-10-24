@@ -5,12 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"kvStore/proto"
 	"kvStore/raft"
 	"kvStore/replication"
 	"kvStore/server"
 	"kvStore/store"
-	"kvStore/wal"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -32,6 +30,7 @@ type options struct {
 	replicationAddr string
 	pprofAddr       string
 	walPath         string
+	peers           string
 }
 
 func main() {
@@ -51,6 +50,7 @@ func run() error {
 	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "peer listen address")
 	flag.StringVar(&opts.pprofAddr, "pprof-addr", "", "optional pprof HTTP listen address")
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
+	flag.StringVar(&opts.peers, "peers", "", "comma separated list of peers e.g. node-b,node-c")
 	flag.Parse() // parse the cmd line arguments
 
 	if opts.nodeID == "" {
@@ -97,6 +97,16 @@ func run() error {
 
 }
 
+// runNode boots one cluster member as a follower:
+// - NewStore: empty in-memory KV
+// - NewFollower: open WAL and replay into the store (no leader pinned yet)
+// - runCtx: cancellable context to stop raft, replication, and client together
+// - NewReplicationServer: bind replication TCP (does not accept until Serve)
+// - OpenNode + SetPeers + go Run: load Raft state, register peers, start elections
+// - NewWithConfig: wire client HTTP server (WAL owned by Follower)
+// - go peerServer.Serve: accept leader replication and apply via Follower
+// - srv.Serve: block serving client requests until shutdown
+// - cleanup: cancel, close replication and follower, surface errors
 func runNode(ctx context.Context, opts options) error {
 	st := store.NewStore[string, []byte]()
 
@@ -126,6 +136,13 @@ func runNode(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("open raft node: %w", err)
 	}
+
+	peersIds := splitNonEmpty(opts.peers)
+	if err := raftNode.SetPeers(peersIds); err != nil {
+		_ = follower.Close()
+		return fmt.Errorf("set raft peers: %w", err)
+	}
+	go raftNode.Run(runCtx, nil) // run the election timer in its own goroutine
 
 	srv := server.NewWithConfig(
 		st,
@@ -347,76 +364,90 @@ func runNode(ctx context.Context, opts options) error {
 // 		return fmt.Errorf("replication server: %w", peerErr)
 // 	}
 
-// 	return nil
+//		return nil
+//	}
+func splitNonEmpty(value string) []string {
+	if value == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+// func parseRole(value string) (replication.Role, error) {
+// 	switch strings.ToLower(strings.TrimSpace(value)) {
+// 	case "leader":
+// 		return replication.RoleLeader, nil
+// 	case "follower":
+// 		return replication.RoleFollower, nil
+// 	default:
+// 		return replication.Role(0), fmt.Errorf(
+// 			"invalid -role %q: expected leader or follower",
+// 			value,
+// 		)
+// 	}
 // }
 
-func parseRole(value string) (replication.Role, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "leader":
-		return replication.RoleLeader, nil
-	case "follower":
-		return replication.RoleFollower, nil
-	default:
-		return replication.Role(0), fmt.Errorf(
-			"invalid -role %q: expected leader or follower",
-			value,
-		)
-	}
-}
+// func parseAddresses(value string) ([]string, error) {
+// 	if strings.TrimSpace(value) == "" {
+// 		return nil, nil
+// 	}
 
-func parseAddresses(value string) ([]string, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, nil
-	}
+// 	parts := strings.Split(value, ",")
+// 	addresses := make([]string, 0, len(parts))
 
-	parts := strings.Split(value, ",")
-	addresses := make([]string, 0, len(parts))
+// 	for _, part := range parts {
+// 		addr := strings.TrimSpace(part)
+// 		if addr == "" {
+// 			return nil, fmt.Errorf("followers contains an empty address")
+// 		}
 
-	for _, part := range parts {
-		addr := strings.TrimSpace(part)
-		if addr == "" {
-			return nil, fmt.Errorf("followers contains an empty address")
-		}
+// 		addresses = append(addresses, addr)
+// 	}
+// 	return addresses, nil
+// }
 
-		addresses = append(addresses, addr)
-	}
-	return addresses, nil
-}
+// func entryFromRecord(rec wal.Record) (replication.Entry, error) {
+// 	var op byte
 
-func entryFromRecord(rec wal.Record) (replication.Entry, error) {
-	var op byte
+// 	switch rec.Op {
+// 	case byte(wal.OpSet):
+// 		op = proto.OpSet
+// 	case byte(wal.OpDel):
+// 		op = proto.OpDel
+// 	default:
+// 		return replication.Entry{}, fmt.Errorf(
+// 			"unsupported WAL operation: %d",
+// 			rec.Op,
+// 		)
+// 	}
 
-	switch rec.Op {
-	case byte(wal.OpSet):
-		op = proto.OpSet
-	case byte(wal.OpDel):
-		op = proto.OpDel
-	default:
-		return replication.Entry{}, fmt.Errorf(
-			"unsupported WAL operation: %d",
-			rec.Op,
-		)
-	}
+// 	return replication.Entry{
+// 		Index: rec.Index,
+// 		Term:  rec.Term,
+// 		Command: proto.Command{
+// 			Op:    op,
+// 			Key:   append([]byte(nil), rec.Key...),
+// 			Value: append([]byte(nil), rec.Value...),
+// 		},
+// 	}, nil
+// }
 
-	return replication.Entry{
-		Index: rec.Index,
-		Term:  rec.Term,
-		Command: proto.Command{
-			Op:    op,
-			Key:   append([]byte(nil), rec.Key...),
-			Value: append([]byte(nil), rec.Value...),
-		},
-	}, nil
-}
-
-func applyCommand(
-	st *store.Store[string, []byte],
-	cmd proto.Command,
-) {
-	switch cmd.Op {
-	case proto.OpSet:
-		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
-	case proto.OpDel:
-		st.Delete(string(cmd.Key))
-	}
-}
+// func applyCommand(
+// 	st *store.Store[string, []byte],
+// 	cmd proto.Command,
+// ) {
+// 	switch cmd.Op {
+// 	case proto.OpSet:
+// 		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+// 	case proto.OpDel:
+// 		st.Delete(string(cmd.Key))
+// 	}
+// }
