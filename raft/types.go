@@ -19,7 +19,7 @@ type LogEntry struct {
 	Command proto.Command
 }
 
-// actual state
+// actual state of a node
 type Node struct {
 	mu sync.RWMutex
 
@@ -78,4 +78,10 @@ func NewNode(id string) *Node {
 		Log:           make([]LogEntry, 0),
 		electionReset: make(chan struct{}, 1),
 	}
+}
+
+func (n *Node) peerIds() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return append([]string(nil), n.peers...)
 }

@@ -6,6 +6,10 @@ const (
 	//	when we read message type byte, we can decode either req or resp
 	messageAppendRequest  byte = 1
 	messageAppendResponse byte = 2
+	messageRequestVote    byte = 3
+	messageRequestVoteRes byte = 4
+	messageHeartbeat      byte = 5
+	messageHeartbeatRes   byte = 6
 
 	maxReplicationFrame = 64 << 20 // 64 * 2^20 = 64 MB ( max message size )
 )

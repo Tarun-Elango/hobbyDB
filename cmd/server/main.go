@@ -50,7 +50,7 @@ func run() error {
 	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "peer listen address")
 	flag.StringVar(&opts.pprofAddr, "pprof-addr", "", "optional pprof HTTP listen address")
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
-	flag.StringVar(&opts.peers, "peers", "", "comma separated list of peers e.g. node-b,node-c")
+	flag.StringVar(&opts.peers, "peers", "", "comma separated id=host:port pairs")
 	flag.Parse() // parse the cmd line arguments
 
 	if opts.nodeID == "" {
@@ -118,31 +118,38 @@ func runNode(ctx context.Context, opts options) error {
 
 	runCtx, cancel := context.WithCancel(ctx) // child context for the node, so we can cancel it if needed
 	defer cancel()
-
-	// listen for peers, this is the "wait for messages" part
-	peerServer, err := replication.NewReplicationServer(
-		runCtx,
-		opts.replicationAddr,
-		follower,
-	)
-	if err != nil {
-		_ = follower.Close()
-		return fmt.Errorf("create replication server: %w", err)
-	}
-
 	// open raft node
 	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
 	if err != nil {
 		_ = follower.Close()
 		return fmt.Errorf("open raft node: %w", err)
 	}
+	// listen for peers, this is the "wait for messages" part
+	peerServer, err := replication.NewReplicationServer(
+		runCtx,
+		opts.replicationAddr,
+		follower,
+		raftNode,
+	)
+	if err != nil {
+		_ = follower.Close()
+		return fmt.Errorf("create replication server: %w", err)
+	}
 
-	peersIds := splitNonEmpty(opts.peers)
-	if err := raftNode.SetPeers(peersIds); err != nil {
+	peerSet, err := replication.NewPeerSet(splitNonEmpty(opts.peers))
+	if err != nil {
+		_ = follower.Close()
+		return err
+	}
+	defer peerSet.Close()
+
+	//peersIds := splitNonEmpty(opts.peers)
+	if err := raftNode.SetPeers(peerSet.IDs()); err != nil {
 		_ = follower.Close()
 		return fmt.Errorf("set raft peers: %w", err)
 	}
-	go raftNode.Run(runCtx, nil) // run the election timer in its own goroutine
+	go raftNode.Run(runCtx, peerSet.RequestVote)         // run the election timer in its own goroutine
+	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat) // run the heartbeat timer in its own goroutine
 
 	srv := server.NewWithConfig(
 		st,
@@ -366,6 +373,8 @@ func runNode(ctx context.Context, opts options) error {
 
 //		return nil
 //	}
+
+// split a comma separated list of non-empty strings
 func splitNonEmpty(value string) []string {
 	if value == "" {
 		return nil

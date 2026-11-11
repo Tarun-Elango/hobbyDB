@@ -179,7 +179,7 @@ func (l *Leader) followerWorker(follower *FollowerState) {
 			// follower still behind, send next batch
 			continue
 		}
-		select {
+		select { // no defer, so stuck here until context is done or wake is sent
 		case <-l.ctx.Done():
 			return
 		case <-follower.wake:

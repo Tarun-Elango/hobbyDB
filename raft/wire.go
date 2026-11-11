@@ -1,8 +1,11 @@
 // tags lets one socket carry votes and leader messages besides append
+package raft
 
-messageAppendRequest  byte = 1
-messageAppendResponse byte = 2
-messageRequestVote    byte = 3
-messageRequestVoteRes byte = 4
-messageHeartbeat      byte = 5
-messageHeartbeatRes   byte = 6
+const (
+	messageAppendRequest  byte = 1
+	messageAppendResponse byte = 2
+	MessageRequestVote    byte = 3
+	MessageRequestVoteRes byte = 4
+	MessageHeartbeat      byte = 5
+	MessageHeartbeatRes   byte = 6
+)

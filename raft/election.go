@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"math/rand/v2"
+	"sync"
 	"time"
 )
 
@@ -60,6 +61,7 @@ func LogIsUptoDate(candIndex, candTerm, localIndex, localTerm uint64) bool {
 	return candIndex >= localIndex
 }
 
+// run the election timer in its own goroutine
 func (n *Node) Run(ctx context.Context, rpc VoteRPC) {
 	timer := time.NewTimer(randomElectionTimeout())
 	defer timer.Stop()
@@ -151,7 +153,11 @@ func (n *Node) startElection(ctx context.Context, rpc VoteRPC) error {
 	n.LeaderID = ""
 	n.mu.Unlock()
 
-	votes := 1
+	var (
+		mu         sync.Mutex
+		votes      = 1
+		higherTerm uint64
+	)
 	if votes >= need {
 		n.becomeLeader(term)
 		return nil
@@ -163,32 +169,48 @@ func (n *Node) startElection(ctx context.Context, rpc VoteRPC) error {
 		LastLogIndex: lastIndex,
 		LastLogTerm:  lastTerm,
 	}
+	electCtx, electCancel := context.WithCancel(ctx)
+	defer electCancel()
 
+	var wg sync.WaitGroup
 	for _, peer := range peers {
-		if ctx.Err() != nil || !n.isCandidate(term) { // node is not a candidate
-			return ctx.Err()
-		}
-		if rpc == nil {
-			continue
-		}
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
 
-		res, err := rpc(ctx, peer, args)
-		if err != nil {
-			continue
-		}
-
-		if res.Term > term { // new leader detected, step down
-			return n.stepDown(res.Term)
-		}
-		if res.VoteGranted {
-			votes++
-			if votes >= need {
-				n.becomeLeader(term)
-				return nil
+			res, err := rpc(electCtx, peer, args)
+			if err != nil || !n.isCandidate(term) {
+				return
 			}
-		}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if res.Term > term {
+				if res.Term > higherTerm {
+					higherTerm = res.Term
+
+				}
+				electCancel()
+				return
+			}
+			if res.VoteGranted {
+				votes++
+				if votes >= need {
+					electCancel()
+				}
+			}
+		}(peer)
+	}
+	wg.Wait()
+
+	if higherTerm > term {
+		return n.stepDown(higherTerm)
 	}
 
+	if votes >= need {
+		n.becomeLeader(term)
+	}
 	return nil
 }
 
@@ -286,4 +308,40 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 		Term:        termNow,
 		VoteGranted: granted,
 	}, nil
+}
+
+func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
+	peers := n.peerIds()
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			ticker := time.NewTicker(electionTimeoutMin / 3)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					snap := n.Snapshot()
+					if snap.Role != Leader || rpc == nil {
+						continue
+					}
+					res, err := rpc(ctx, peer, HeartbeatArgs{
+						Term:     snap.CurrentTerm,
+						LeaderID: snap.LeaderID,
+					})
+					if err != nil {
+						continue
+					}
+					if res.Term > snap.CurrentTerm {
+						_ = n.stepDown(res.Term)
+					}
+				}
+			}
+		}(peer)
+	}
+	wg.Wait()
 }

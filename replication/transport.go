@@ -7,9 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"kvStore/raft"
 	"net"
 	"sync"
 	"time"
+)
+
+const (
+	rpcAttemptTimeout = 80 * time.Millisecond
+	rpcAttempts       = 3
 )
 
 type PeerClient interface {
@@ -30,6 +36,73 @@ func NewTCPPeerClient(addr string) *TCPPeerClient {
 	return &TCPPeerClient{
 		addr: addr,
 	}
+}
+
+// shared helper: do one rpc to the follower over a reused tcp connection
+func (c *TCPPeerClient) roundTrip(
+	ctx context.Context,
+	write func(net.Conn) error,
+	read func(net.Conn) error,
+) error {
+	if c == nil {
+		return errors.New("replication: nil TCP peer client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return errors.New("replication: peer client is closed")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if c.conn == nil {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.addr)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("replication: dial follower %s: %w", c.addr, err)
+		}
+		c.conn = conn
+	}
+
+	conn := c.conn
+	stopCancelWatcher := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancelWatcher()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			c.invalidateLocked(conn)
+			return err
+		}
+	}
+	defer conn.SetDeadline(time.Time{})
+
+	if err := write(conn); err != nil {
+		c.invalidateLocked(conn)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("replication: write to %s: %w", c.addr, err)
+	}
+
+	if err := read(conn); err != nil {
+		c.invalidateLocked(conn)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("replication: read from %s: %w", c.addr, err)
+	}
+	return ctx.Err()
 }
 
 // sends replication request from leader to follower
@@ -164,10 +237,82 @@ func (c *TCPPeerClient) Close() error {
 	return err
 }
 
+func (c *TCPPeerClient) RequestVote(
+	ctx context.Context,
+	args raft.RequestVoteArgs,
+) (raft.RequestVoteResult, error) {
+	var last error
+	for attempts := 0; attempts < rpcAttempts; attempts++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		var res raft.RequestVoteResult
+		err := c.roundTrip(attemptCtx,
+			func(conn net.Conn) error { return EncodeRequestVote(conn, args) },
+			func(conn net.Conn) error {
+				frame, err := readFrame(conn)
+				if err != nil {
+					return err
+				}
+				if frame.messageType != messageRequestVoteRes {
+					return fmt.Errorf("replication: unexpected frame type: %d", frame.messageType)
+				}
+				res, err = DecodeRequestVoteResultPayload(frame.payload)
+				return err
+			},
+		)
+		cancel()
+		if err == nil {
+			return res, nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			return raft.RequestVoteResult{}, ctx.Err()
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return raft.RequestVoteResult{}, last
+}
+
+func (c *TCPPeerClient) Heartbeat(
+	ctx context.Context,
+	args raft.HeartbeatArgs,
+) (raft.HeartbeatResult, error) {
+	var last error
+	for attempts := 0; attempts < rpcAttempts; attempts++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		var res raft.HeartbeatResult
+		err := c.roundTrip(attemptCtx,
+			func(conn net.Conn) error { return EncodeHeartbeat(conn, args) },
+			func(conn net.Conn) error {
+				frame, err := readFrame(conn)
+				if err != nil {
+					return err
+				}
+				if frame.messageType != messageHeartbeatRes {
+					return fmt.Errorf("replication: unexpected frame type: %d", frame.messageType)
+				}
+				res, err = DecodeHeartbeatResultPayload(frame.payload)
+				return err
+			},
+		)
+		cancel()
+
+		if err == nil {
+			return res, nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			return raft.HeartbeatResult{}, ctx.Err()
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return raft.HeartbeatResult{}, last
+}
+
 // replication server owns replication listener and all peer connections
 type ReplicationServer struct {
 	listener net.Listener
 	follower *Follower
+	raftNode *raft.Node
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -186,11 +331,14 @@ func NewReplicationServer(
 	ctx context.Context,
 	addr string,
 	follower *Follower,
+	raftNode *raft.Node,
 ) (*ReplicationServer, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
+	if raftNode == nil {
+		return nil, errors.New("replication: raft node cannot be nil")
+	}
 	if follower == nil {
 		return nil, errors.New("replication: follower cannot be nil")
 	}
@@ -214,6 +362,7 @@ func NewReplicationServer(
 	server := &ReplicationServer{
 		listener:    listener,
 		follower:    follower,
+		raftNode:    raftNode,
 		ctx:         serverCtx,
 		cancel:      cancel,
 		connections: make(map[net.Conn]struct{}),
@@ -289,7 +438,7 @@ func (s *ReplicationServer) serveConnection(conn net.Conn) {
 		s.wg.Done()
 	}()
 
-	serveReplicationConnection(s.ctx, conn, s.follower)
+	serveReplicationConnection(s.ctx, conn, s.follower, s.raftNode)
 }
 
 // stop accepting connections and close all peer connections
@@ -338,7 +487,7 @@ func ServerReplication(conn net.Conn, follower *Follower) {
 // ServeReplication is the standalone connection handler required by replication
 // transport api
 func ServeReplication(conn net.Conn, follower *Follower) {
-	serveReplicationConnection(context.Background(), conn, follower)
+	serveReplicationConnection(context.Background(), conn, follower, nil)
 }
 
 // follower side loop for 1 tcp connection ( handle 1 tcp conn)
@@ -347,6 +496,7 @@ func serveReplicationConnection(
 	ctx context.Context,
 	conn net.Conn,
 	follower *Follower,
+	raftNode *raft.Node,
 ) {
 	if conn == nil {
 		return
@@ -362,29 +512,62 @@ func serveReplicationConnection(
 			return
 		}
 
-		req, err := DecodeAppendRequest(conn)
+		frame, err := readFrame(conn)
 		if err != nil {
-
-			_ = EncodeAppendResponse(conn, AppendResponse{
-				Success: false,
-				Code:    AppendErrorInvalid,
-				Error:   fmt.Sprintf("decode append request: %v", err),
-			})
 			return
 		}
-
-		if follower == nil {
-			_ = EncodeAppendResponse(conn, AppendResponse{
-				Success: false,
-				Code:    AppendErrorInternal,
-				Error:   "replication: nil follower",
-			})
+		if frame.protocolVersion != messageProtocol {
 			return
 		}
-
-		resp := follower.ApplyAppend(req) // actual append work
-
-		if err := EncodeAppendResponse(conn, resp); err != nil {
+		switch frame.messageType {
+		case messageAppendRequest:
+			req, err := decodeAppendRequestPayload(frame.payload)
+			if err != nil {
+				_ = EncodeAppendResponse(conn, AppendResponse{
+					Success: false,
+					Code:    AppendErrorInvalid,
+					Error:   fmt.Sprintf("decode append request: %v", err),
+				})
+				return
+			}
+			if follower == nil {
+				_ = EncodeAppendResponse(conn, AppendResponse{
+					Success: false,
+					Code:    AppendErrorInternal,
+					Error:   "replication: nil follower",
+				})
+				return
+			}
+			if err := EncodeAppendResponse(conn, follower.ApplyAppend(req)); err != nil {
+				return
+			}
+		case messageRequestVote:
+			if raftNode == nil {
+				return
+			}
+			args, err := DecodeRequestVotePayload(frame.payload)
+			if err != nil {
+				return
+			}
+			res, _ := raftNode.HandleRequestVote(args)
+			if err := EncodeRequestVoteResult(conn, res); err != nil {
+				return
+			}
+		case messageHeartbeat:
+			if raftNode == nil {
+				return
+			}
+			args, err := DecodeHeartbeatPayload(frame.payload)
+			if err != nil {
+				return
+			}
+			_ = raftNode.ObserverLeader(args.Term, args.LeaderID)
+			if err := EncodeHeartbeatResult(conn, raft.HeartbeatResult{
+				Term: raftNode.Snapshot().CurrentTerm,
+			}); err != nil {
+				return
+			}
+		default:
 			return
 		}
 	}

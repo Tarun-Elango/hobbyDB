@@ -150,7 +150,11 @@ func DecodeAppendRequest(r io.Reader) (AppendRequest, error) {
 		)
 	}
 
-	reader := bytes.NewReader(frame.payload) // byte slice to reader, so we can read fields sequentially
+	return decodeAppendRequestPayload(frame.payload)
+}
+
+func decodeAppendRequestPayload(payload []byte) (AppendRequest, error) {
+	reader := bytes.NewReader(payload) // byte slice to reader, so we can read fields sequentially
 
 	leaderIDLength, err := readU16(reader)
 	if err != nil {
@@ -258,7 +262,6 @@ func DecodeAppendRequest(r io.Reader) (AppendRequest, error) {
 	}
 
 	return req, nil
-
 }
 
 // EncodeAppendResponse writes:
