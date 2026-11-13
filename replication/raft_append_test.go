@@ -14,6 +14,7 @@ func TestRaftAppendEntriesRoundTrip(t *testing.T) {
 		LeaderID:     "node-a",
 		PrevLogIndex: 2,
 		PrevLogTerm:  3,
+		LeaderCommit: 2,
 		Entries: []raft.LogEntry{{
 			Index: 3,
 			Term:  4,
@@ -40,7 +41,7 @@ func TestRaftAppendEntriesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Term != args.Term || got.LeaderID != args.LeaderID || got.PrevLogIndex != args.PrevLogIndex || got.PrevLogTerm != args.PrevLogTerm {
+	if got.Term != args.Term || got.LeaderID != args.LeaderID || got.PrevLogIndex != args.PrevLogIndex || got.PrevLogTerm != args.PrevLogTerm || got.LeaderCommit != args.LeaderCommit {
 		t.Fatalf("header = %+v", got)
 	}
 	if len(got.Entries) != 1 || string(got.Entries[0].Command.Value) != "ada" || got.Entries[0].Term != 4 {

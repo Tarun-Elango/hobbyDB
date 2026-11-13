@@ -14,9 +14,7 @@ const (
 	appendRetryBackoff      = 50 * time.Millisecond
 )
 
-// leader to peer log copy
-// leader sends etnry to each peer ( with index and term of entry before it)
-// if peers logs don't match, leader walks back until logs meet ( just for that peer)
+// AppendEntries RPC: leader copies log entries to peers and reports its commit index.
 
 type AppendEntriesArgs struct {
 	Term         uint64
@@ -24,6 +22,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
 	Entries      []LogEntry
+	LeaderCommit uint64 // leader's commitIndex; follower may advance up to the matched prefix
 }
 
 type AppendEntriesResult struct {
@@ -33,7 +32,42 @@ type AppendEntriesResult struct {
 
 type AppendEntriesRPC func(ctx context.Context, peerId string, args AppendEntriesArgs) (AppendEntriesResult, error)
 
-// records the command in leader's, and returns before any peer has the entry
+// ---- shared (leader + follower log helpers)
+
+func (n *Node) logTermAtLocked(index uint64) (uint64, bool) {
+	if index == 0 {
+		return 0, true
+	}
+	if index > uint64(len(n.Log)) {
+		return 0, false
+	}
+	entry := n.Log[index-1]
+	if entry.Index != index {
+		return 0, false
+	}
+	return entry.Term, true
+}
+
+func logEntryWireSize(entry LogEntry) int {
+	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+}
+
+func cloneLogEntry(entry LogEntry) LogEntry {
+	return LogEntry{
+		Index: entry.Index,
+		Term:  entry.Term,
+		Command: proto.Command{
+			Op:    entry.Command.Op,
+			Key:   append([]byte(nil), entry.Command.Key...),
+			Value: append([]byte(nil), entry.Command.Value...),
+		},
+	}
+}
+
+// ---- leader funcs
+
+// records the command in the leader's log.
+// commitIndex moves here only when this node is already a majority (a single-node cluster).
 func (n *Node) Propose(cmd proto.Command) (LogEntry, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -53,6 +87,7 @@ func (n *Node) Propose(cmd proto.Command) (LogEntry, error) {
 		},
 	}
 	n.Log = append(n.Log, entry) // add new entry to log
+	n.advanceCommitLocked()
 
 	for _, ch := range n.peerWake {
 		select {
@@ -63,7 +98,7 @@ func (n *Node) Propose(cmd proto.Command) (LogEntry, error) {
 	return entry, nil
 }
 
-// senders
+// start one goroutine per peer to send append entries requests
 func (n *Node) RunReplication(ctx context.Context, rpc AppendEntriesRPC) {
 	peers := n.peerIds()
 	var wg sync.WaitGroup
@@ -77,6 +112,7 @@ func (n *Node) RunReplication(ctx context.Context, rpc AppendEntriesRPC) {
 	wg.Wait()
 }
 
+// per peer, ask what to send, send it, and wait for response
 func (n *Node) replicatePeer(ctx context.Context, peer string, rpc AppendEntriesRPC) {
 	n.mu.RLock()
 	wake := n.peerWake[peer]
@@ -123,7 +159,7 @@ func (n *Node) waitPeer(ctx context.Context, wake <-chan struct{}, delay time.Du
 	}
 }
 
-// sends previous index and term, then every entry from next index to last sent
+// build one AppendEntriesArgs for this peer; if caught up, return false
 func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -142,7 +178,7 @@ func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool)
 		return AppendEntriesArgs{}, 0, 0, false
 	}
 
-	header := 8 + 2 + len(n.ID) + 8 + 8 + 4
+	header := 8 + 2 + len(n.ID) + 8 + 8 + 8 + 4 // term, id len, id, prev index, prev term, leader commit, count
 	entries := make([]LogEntry, 0, appendEntriesBatchLimit)
 	size := header
 	for _, entry := range n.Log[next-1:] {
@@ -164,27 +200,11 @@ func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool)
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
+		LeaderCommit: n.CommitIndex,
 	}, n.CurrentTerm, lastSent, true
 }
 
-func logEntryWireSize(entry LogEntry) int {
-	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
-}
-func (n *Node) logTermAtLocked(index uint64) (uint64, bool) {
-	if index == 0 {
-		return 0, true
-	}
-	if index > uint64(len(n.Log)) {
-		return 0, false
-	}
-	entry := n.Log[index-1]
-	if entry.Index != index {
-		return 0, false
-	}
-	return entry.Term, true
-}
-
-// steps down when the peer has a higher term
+// read follower response: step down, decrement next index, or update match index and maybe commit
 func (n *Node) handleAppendResult(peer string, term uint64, lastSent uint64, nEntries int, res AppendEntriesResult) {
 	if res.Term > term {
 		_ = n.stepDown(res.Term)
@@ -204,8 +224,41 @@ func (n *Node) handleAppendResult(peer string, term uint64, lastSent uint64, nEn
 	if nEntries > 0 && lastSent > n.matchIndex[peer] {
 		n.matchIndex[peer] = lastSent
 		n.nextIndex[peer] = lastSent + 1
+		n.advanceCommitLocked()
 	}
 }
+
+// A write is committed once a majority of the cluster has it in the log.
+// Count this leader as one copy. Only an entry from the current term may
+// move commitIndex; every earlier entry commits with it.
+func (n *Node) advanceCommitLocked() {
+	if n.Role != Leader {
+		return
+	}
+	for i := len(n.Log); i > int(n.CommitIndex); i-- {
+		entry := n.Log[i-1]
+		if entry.Index != uint64(i) || entry.Term != n.CurrentTerm {
+			continue
+		}
+		if n.copiesAtLocked(entry.Index) >= n.quorumLocked() {
+			n.CommitIndex = entry.Index
+			return
+		}
+	}
+}
+
+// copies of this index: the leader, plus each peer whose matchIndex has reached it.
+func (n *Node) copiesAtLocked(index uint64) int {
+	count := 1
+	for _, peer := range n.peers {
+		if n.matchIndex[peer] >= index {
+			count++
+		}
+	}
+	return count
+}
+
+// ---- follower funcs -----
 
 func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult, error) {
 	snap := n.Snapshot()
@@ -247,18 +300,26 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 		n.Log = append(n.Log, cloneLogEntry(entry))
 	}
 
+	matchedThrough := args.PrevLogIndex
+	if len(args.Entries) > 0 {
+		matchedThrough = args.Entries[len(args.Entries)-1].Index
+	}
+	n.advanceFollowerCommitLocked(args.LeaderCommit, matchedThrough)
+
 	n.pokeElectionTimer()
 	return AppendEntriesResult{Term: n.CurrentTerm, Success: true}, nil
 }
 
-func cloneLogEntry(entry LogEntry) LogEntry {
-	return LogEntry{
-		Index: entry.Index,
-		Term:  entry.Term,
-		Command: proto.Command{
-			Op:    entry.Command.Op,
-			Key:   append([]byte(nil), entry.Command.Key...),
-			Value: append([]byte(nil), entry.Command.Value...),
-		},
+// follower learns the leader's commit index, capped at the prefix this RPC matched.
+func (n *Node) advanceFollowerCommitLocked(leaderCommit, matchedThrough uint64) {
+	if leaderCommit <= n.CommitIndex {
+		return
+	}
+	commit := leaderCommit
+	if matchedThrough < commit {
+		commit = matchedThrough
+	}
+	if commit > n.CommitIndex {
+		n.CommitIndex = commit
 	}
 }

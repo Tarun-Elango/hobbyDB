@@ -169,6 +169,9 @@ func EncodeRaftAppendEntries(w io.Writer, args raft.AppendEntriesArgs) error {
 	if err := writeU64(&payload, args.PrevLogTerm); err != nil {
 		return err
 	}
+	if err := writeU64(&payload, args.LeaderCommit); err != nil {
+		return err
+	}
 	if err := writeU32(&payload, uint32(len(args.Entries))); err != nil {
 		return err
 	}
@@ -212,6 +215,10 @@ func DecodeRaftAppendEntriesPayload(payload []byte) (raft.AppendEntriesArgs, err
 	if err != nil {
 		return raft.AppendEntriesArgs{}, err
 	}
+	leaderCommit, err := readU64(r)
+	if err != nil {
+		return raft.AppendEntriesArgs{}, err
+	}
 	count, err := readU32(r)
 	if err != nil {
 		return raft.AppendEntriesArgs{}, err
@@ -236,6 +243,7 @@ func DecodeRaftAppendEntriesPayload(payload []byte) (raft.AppendEntriesArgs, err
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
+		LeaderCommit: leaderCommit,
 	}
 	if err := validateRaftAppendEntries(args); err != nil {
 		return raft.AppendEntriesArgs{}, err

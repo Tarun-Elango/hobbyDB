@@ -19,30 +19,33 @@ type LogEntry struct {
 	Command proto.Command
 }
 
-// actual state of a node
+// Node holds one cluster member's Raft state (follower, candidate, or leader).
 type Node struct {
 	mu sync.RWMutex
 
+	// ---- identity ----
 	ID        string
-	statePath string
+	statePath string // file path for saving state to disk
 
+	// ---- all roles ----
 	Role        Role
 	CurrentTerm uint64
-	VotedFor    string
-	LeaderID    string
+	Log         []LogEntry
 
-	CommitIndex uint64 // highest log index known to be committed
-	LastApplied uint64 // highest committed index applied to the key-value store
-
-	Log []LogEntry
-
+	// ---- follower + candidate (elections) ----
+	VotedFor      string
+	LeaderID      string
 	peers         []string
 	electionReset chan struct{}
 
-	// per peer copy progress
-	nextIndex  map[string]uint64        // next index to send to peer
-	matchIndex map[string]uint64        // highest index known to be replicated to peer
-	peerWake   map[string]chan struct{} // lets new write wake the peers sender
+	// ---- leader (log replication) ----
+	nextIndex  map[string]uint64        // next log index to send to each peer
+	matchIndex map[string]uint64        // highest index known copied on each peer
+	peerWake   map[string]chan struct{} // wake per-peer replication workers
+
+	// ---- commit + apply to KV store ----
+	CommitIndex uint64 // highest log index known to be committed ( global)
+	LastApplied uint64 // highest committed index applied to the store ( purely local)
 }
 
 // read only copy, thread safe
