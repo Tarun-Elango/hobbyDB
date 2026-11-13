@@ -308,6 +308,42 @@ func (c *TCPPeerClient) Heartbeat(
 	return raft.HeartbeatResult{}, last
 }
 
+// sends append entries request from leader to follower
+func (c *TCPPeerClient) AppendEntries(
+	ctx context.Context,
+	args raft.AppendEntriesArgs,
+) (raft.AppendEntriesResult, error) {
+	var last error
+	for attempts := 0; attempts < rpcAttempts; attempts++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		var res raft.AppendEntriesResult
+		err := c.roundTrip(attemptCtx,
+			func(conn net.Conn) error { return EncodeRaftAppendEntries(conn, args) },
+			func(conn net.Conn) error {
+				frame, err := readFrame(conn)
+				if err != nil {
+					return err
+				}
+				if frame.messageType != messageRaftAppendEntriesRes {
+					return fmt.Errorf("replication: unexpected frame type: %d", frame.messageType)
+				}
+				res, err = DecodeRaftAppendEntriesResultPayload(frame.payload)
+				return err
+			},
+		)
+		cancel()
+		if err == nil {
+			return res, nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			return raft.AppendEntriesResult{}, ctx.Err()
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return raft.AppendEntriesResult{}, last
+}
+
 // replication server owns replication listener and all peer connections
 type ReplicationServer struct {
 	listener net.Listener
@@ -551,6 +587,21 @@ func serveReplicationConnection(
 			}
 			res, _ := raftNode.HandleRequestVote(args)
 			if err := EncodeRequestVoteResult(conn, res); err != nil {
+				return
+			}
+		case messageRaftAppendEntries:
+			if raftNode == nil {
+				return
+			}
+			args, err := DecodeRaftAppendEntriesPayload(frame.payload)
+			if err != nil {
+				return
+			}
+			res, err := raftNode.HandleAppendEntries(args)
+			if err != nil {
+				return
+			}
+			if err := EncodeRaftAppendEntriesResult(conn, res); err != nil {
 				return
 			}
 		case messageHeartbeat:

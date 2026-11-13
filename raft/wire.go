@@ -8,4 +8,7 @@ const (
 	MessageRequestVoteRes byte = 4
 	MessageHeartbeat      byte = 5
 	MessageHeartbeatRes   byte = 6
+
+	MessageRaftAppendEntries    byte = 7
+	MessageRaftAppendEntriesRes byte = 8
 )

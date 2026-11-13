@@ -3,10 +3,8 @@ package raft
 import "fmt"
 
 func (n *Node) SetPeers(peerIds []string) error {
-
-	// use to check for duplicate
 	seen := map[string]struct{}{
-		n.ID: {}, // key string and value struct{}, init with n.ID and empty struct
+		n.ID: {},
 	}
 	for _, peerId := range peerIds {
 		if peerId == "" {
@@ -18,8 +16,14 @@ func (n *Node) SetPeers(peerIds []string) error {
 		seen[peerId] = struct{}{}
 	}
 
+	wakes := make(map[string]chan struct{}, len(peerIds))
+	for _, id := range peerIds {
+		wakes[id] = make(chan struct{}, 1)
+	}
+
 	n.mu.Lock()
-	n.peers = append([]string(nil), peerIds...) // create a copy of the peer IDs, and assign
+	n.peers = append([]string(nil), peerIds...)
+	n.peerWake = wakes
 	n.mu.Unlock()
 	return nil
 }

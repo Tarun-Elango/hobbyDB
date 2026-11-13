@@ -38,6 +38,11 @@ type Node struct {
 
 	peers         []string
 	electionReset chan struct{}
+
+	// per peer copy progress
+	nextIndex  map[string]uint64        // next index to send to peer
+	matchIndex map[string]uint64        // highest index known to be replicated to peer
+	peerWake   map[string]chan struct{} // lets new write wake the peers sender
 }
 
 // read only copy, thread safe

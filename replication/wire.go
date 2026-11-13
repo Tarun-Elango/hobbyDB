@@ -11,6 +11,9 @@ const (
 	messageHeartbeat      byte = 5
 	messageHeartbeatRes   byte = 6
 
+	messageRaftAppendEntries    byte = 7
+	messageRaftAppendEntriesRes byte = 8
+
 	maxReplicationFrame = 64 << 20 // 64 * 2^20 = 64 MB ( max message size )
 )
 

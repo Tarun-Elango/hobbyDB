@@ -55,6 +55,18 @@ func (p *PeerSet) RequestVote(
 	return clients.RequestVote(ctx, args)
 }
 
+func (p *PeerSet) AppendEntries(
+	ctx context.Context,
+	peerID string,
+	args raft.AppendEntriesArgs,
+) (raft.AppendEntriesResult, error) {
+	client := p.clients[peerID]
+	if client == nil {
+		return raft.AppendEntriesResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
+	}
+	return client.AppendEntries(ctx, args)
+}
+
 func (p *PeerSet) Heartbeat(
 	ctx context.Context,
 	peerID string,

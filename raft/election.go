@@ -231,6 +231,25 @@ func (n *Node) becomeLeader(term uint64) {
 
 	n.Role = Leader
 	n.LeaderID = n.ID
+
+	lastIndex, _ := n.lastLogLocked()
+	n.nextIndex = make(map[string]uint64, len(n.peers))
+	n.matchIndex = make(map[string]uint64, len(n.peers))
+
+	// for each peer, set the next index to the last index + 1 and the match index to 0
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = lastIndex + 1
+		n.matchIndex[peer] = 0 // 0 cause we haven't replicated anything to this peer yet
+	}
+
+	for _, ch := range n.peerWake {
+		select {
+		case ch <- struct{}{}: // wake the peer's sender, by sending a empty struct
+		default:
+		}
+	}
+
+	// assume every peer if caught up, fail append will walk back until logs meet
 }
 
 func (n *Node) stepDown(term uint64) error {
@@ -310,6 +329,7 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 	}, nil
 }
 
+// send heartbeats to peers in a goroutine
 func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
 	peers := n.peerIds()
 	var wg sync.WaitGroup

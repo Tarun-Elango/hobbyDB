@@ -148,8 +148,9 @@ func runNode(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("set raft peers: %w", err)
 	}
-	go raftNode.Run(runCtx, peerSet.RequestVote)         // run the election timer in its own goroutine
-	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat) // run the heartbeat timer in its own goroutine
+	go raftNode.Run(runCtx, peerSet.RequestVote)              // run the election timer in its own goroutine
+	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)      // run the heartbeat timer in its own goroutine
+	go raftNode.RunReplication(runCtx, peerSet.AppendEntries) // copy the leader log to peers
 
 	srv := server.NewWithConfig(
 		st,
