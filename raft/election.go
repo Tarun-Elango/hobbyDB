@@ -261,7 +261,7 @@ func (n *Node) stepDown(term uint64) error {
 	if n.CurrentTerm == term {
 		n.Role = Follower
 		n.LeaderID = ""
-
+		n.applyCond.Broadcast() // unblock Propose waiting to apply
 	}
 	n.mu.Unlock()
 	n.pokeElectionTimer()

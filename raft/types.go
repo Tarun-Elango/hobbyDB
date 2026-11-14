@@ -44,8 +44,9 @@ type Node struct {
 	peerWake   map[string]chan struct{} // wake per-peer replication workers
 
 	// ---- commit + apply to KV store ----
-	CommitIndex uint64 // highest log index known to be committed ( global)
-	LastApplied uint64 // highest committed index applied to the store ( purely local)
+	CommitIndex uint64     // highest log index known to be committed ( global)
+	LastApplied uint64     // highest committed index applied to the store ( purely local)
+	applyCond   *sync.Cond // wakes the apply loop and anyone waiting for an entry to be applied
 }
 
 // read only copy, thread safe
@@ -80,12 +81,14 @@ func (n *Node) Snapshot() Snapshot {
 }
 
 func NewNode(id string) *Node {
-	return &Node{
+	n := &Node{
 		ID:            id,
 		Role:          Follower,
 		Log:           make([]LogEntry, 0),
 		electionReset: make(chan struct{}, 1),
 	}
+	n.applyCond = sync.NewCond(&n.mu)
+	return n
 }
 
 func (n *Node) peerIds() []string {

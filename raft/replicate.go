@@ -67,8 +67,9 @@ func cloneLogEntry(entry LogEntry) LogEntry {
 // ---- leader funcs
 
 // records the command in the leader's log.
-// commitIndex moves here only when this node is already a majority (a single-node cluster).
-func (n *Node) Propose(cmd proto.Command) (LogEntry, error) {
+// returns only after that entry is committed by a majority and applied to the store.
+// commitIndex moves inside this call only when this node is already a majority (a single-node cluster).
+func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -94,6 +95,29 @@ func (n *Node) Propose(cmd proto.Command) (LogEntry, error) {
 		case ch <- struct{}{}:
 		default:
 		}
+	}
+
+	// ctx cancel has to wake this wait; applyCond alone only fires on commit/apply.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			n.mu.Lock()
+			n.applyCond.Broadcast()
+			n.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	for n.LastApplied < entry.Index {
+		if ctx.Err() != nil {
+			return LogEntry{}, ctx.Err()
+		}
+		if n.Role != Leader || n.CurrentTerm != entry.Term {
+			return LogEntry{}, fmt.Errorf("lost leadership before apply")
+		}
+		n.applyCond.Wait()
 	}
 	return entry, nil
 }
@@ -235,6 +259,7 @@ func (n *Node) advanceCommitLocked() {
 	if n.Role != Leader {
 		return
 	}
+	prev := n.CommitIndex
 	for i := len(n.Log); i > int(n.CommitIndex); i-- {
 		entry := n.Log[i-1]
 		if entry.Index != uint64(i) || entry.Term != n.CurrentTerm {
@@ -242,6 +267,9 @@ func (n *Node) advanceCommitLocked() {
 		}
 		if n.copiesAtLocked(entry.Index) >= n.quorumLocked() {
 			n.CommitIndex = entry.Index
+			if n.CommitIndex > prev {
+				n.applyCond.Broadcast()
+			}
 			return
 		}
 	}
@@ -276,8 +304,12 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 	if n.CurrentTerm != args.Term {
 		return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
 	}
+	wasLeader := n.Role == Leader
 	n.Role = Follower
 	n.LeaderID = args.LeaderID
+	if wasLeader {
+		n.applyCond.Broadcast()
+	}
 
 	prevTerm, ok := n.logTermAtLocked(args.PrevLogIndex)
 	if !ok || prevTerm != args.PrevLogTerm {
@@ -321,5 +353,6 @@ func (n *Node) advanceFollowerCommitLocked(leaderCommit, matchedThrough uint64) 
 	}
 	if commit > n.CommitIndex {
 		n.CommitIndex = commit
+		n.applyCond.Broadcast()
 	}
 }
