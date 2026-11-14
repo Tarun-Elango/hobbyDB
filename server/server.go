@@ -17,6 +17,9 @@ import (
 	"time"
 )
 
+// How long a client write waits for Raft to copy it to a majority and apply it.
+const raftProposeTimeout = 5 * time.Second
+
 // config from user input, to set the server state like role, addr
 type Config struct {
 	Role       replication.Role
@@ -26,6 +29,9 @@ type Config struct {
 	LeaderReplicator   *replication.Leader
 	FollowerReplicator *replication.Follower
 	RaftNode           *raft.Node
+	// ClientAddrs maps a Raft node id to the address clients dial.
+	// A follower uses it to redirect writes to the current leader.
+	ClientAddrs map[string]string
 }
 
 // the actual running server object with the store
@@ -54,7 +60,8 @@ type Server struct {
 	shutDownOnce sync.Once      // helps ensure shutdown only happens once, sync.once guarantees once execution - used in shutdown
 	logCloseOnce sync.Once
 
-	raftNode *raft.Node
+	raftNode    *raft.Node
+	clientAddrs map[string]string
 }
 
 // constructor, takes store, returns server pointer
@@ -62,6 +69,7 @@ func New(s *store.Store[string, []byte], log *wal.Log) *Server {
 	return &Server{
 		store:       s,
 		log:         log,
+		nextIndex:   1,
 		connections: make(map[net.Conn]struct{}), // make a set, we keep value as empty struct - no mem alloc
 	}
 }
@@ -85,7 +93,19 @@ func NewWithConfig(
 		followerReplicator: cfg.FollowerReplicator,
 		connections:        make(map[net.Conn]struct{}),
 		raftNode:           cfg.RaftNode,
+		clientAddrs:        copyClientAddrs(cfg.ClientAddrs),
 	}
+}
+
+func copyClientAddrs(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for id, addr := range src {
+		out[id] = addr
+	}
+	return out
 }
 
 // listen for connections, accept, handle
@@ -149,7 +169,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		s.handlers.Done() //decrememnt counter by 1
 		fmt.Printf("Disconnected %s \n", conn.RemoteAddr())
 	}()
-	if err := s.handleConn(conn); err != nil && ctx.Err() == nil {
+	if err := s.handleConn(ctx, conn); err != nil && ctx.Err() == nil {
 		fmt.Printf("connection %s error: %v\n", conn.RemoteAddr(), err)
 	}
 }
@@ -193,7 +213,7 @@ func (s *Server) shutdown() {
 
 // loop forever, every iteration 1 command
 // decode call dispatch, encode resp - written back to client
-func (s *Server) handleConn(conn net.Conn) error {
+func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 	// add a small memory buffer around the tcp connection - need to flush to send
 	// reason - read more effecient, bufio pulls more from conn than asked
 	// write can be chunked before flushing together.
@@ -210,7 +230,7 @@ func (s *Server) handleConn(conn net.Conn) error {
 			return err
 		}
 
-		resp, err := s.dispatch(cmd)
+		resp, err := s.dispatch(ctx, cmd)
 		if err != nil {
 			return err
 		}
@@ -226,7 +246,7 @@ func (s *Server) handleConn(conn net.Conn) error {
 }
 
 // perform based on command, return response obj
-func (s *Server) dispatch(cmd proto.Command) (proto.Response, error) {
+func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Response, error) {
 	switch cmd.Op {
 	case proto.OpGet:
 		val, ok := s.store.Get(string(cmd.Key))
@@ -235,11 +255,12 @@ func (s *Server) dispatch(cmd proto.Command) (proto.Response, error) {
 		}
 		return proto.Response{Status: proto.StatusOk, Value: val}, nil
 	case proto.OpSet, proto.OpDel:
+		// Cluster nodes decide leadership from Raft, not from the startup role.
+		if s.raftNode != nil {
+			return s.proposeRaftWrite(ctx, cmd)
+		}
 		if s.role != replication.RoleLeader {
-			return proto.Response{
-				Status: proto.StatusNotLeader,
-				Value:  []byte(s.leaderAddr),
-			}, nil
+			return notLeaderResponse(s.leaderAddr), nil
 		}
 
 		return s.applyLeaderWrite(cmd)
@@ -257,7 +278,57 @@ func (s *Server) dispatch(cmd proto.Command) (proto.Response, error) {
 	}
 }
 
-// write pipeline for reader ( set/del	)
+// proposeRaftWrite appends the command on the leader and replies only after
+// a majority has the entry and this node has applied it.
+// A follower answers with the leader's client address when it knows one,
+// otherwise the leader's node id.
+func (s *Server) proposeRaftWrite(ctx context.Context, cmd proto.Command) (proto.Response, error) {
+	snap := s.raftNode.Snapshot()
+	if snap.Role != raft.Leader {
+		return notLeaderResponse(s.leaderTarget(snap.LeaderID)), nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	proposeCtx, cancel := context.WithTimeout(ctx, raftProposeTimeout)
+	defer cancel()
+
+	_, err := s.raftNode.Propose(proposeCtx, cmd)
+	if err == nil {
+		return proto.Response{Status: proto.StatusOk}, nil
+	}
+	if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLostLeadership) {
+		return notLeaderResponse(s.leaderTarget(s.raftNode.Snapshot().LeaderID)), nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte("timed out waiting for the write to commit"),
+		}, nil
+	}
+	return proto.Response{}, err
+}
+
+func notLeaderResponse(leaderID string) proto.Response {
+	return proto.Response{
+		Status: proto.StatusNotLeader,
+		Value:  []byte(leaderID),
+	}
+}
+
+// leaderTarget is the dial address for leaderID, or the id itself when this
+// node was not given that member's client address.
+func (s *Server) leaderTarget(leaderID string) string {
+	if leaderID == "" {
+		return ""
+	}
+	if addr := s.clientAddrs[leaderID]; addr != "" {
+		return addr
+	}
+	return leaderID
+}
+
+// write pipeline for a standalone server that is not part of a Raft cluster.
 func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

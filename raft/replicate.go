@@ -2,10 +2,17 @@ package raft
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"kvStore/proto"
 	"sync"
 	"time"
+)
+
+var (
+	// ErrNotLeader means this node cannot accept the write.
+	ErrNotLeader = errors.New("not leader")
+	// ErrLostLeadership means this node stepped down before the write was applied.
+	ErrLostLeadership = errors.New("lost leadership before apply")
 )
 
 const (
@@ -74,7 +81,7 @@ func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error)
 	defer n.mu.Unlock()
 
 	if n.Role != Leader {
-		return LogEntry{}, fmt.Errorf("not leader")
+		return LogEntry{}, ErrNotLeader
 	}
 
 	lastIndex, _ := n.lastLogLocked()
@@ -115,7 +122,7 @@ func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error)
 			return LogEntry{}, ctx.Err()
 		}
 		if n.Role != Leader || n.CurrentTerm != entry.Term {
-			return LogEntry{}, fmt.Errorf("lost leadership before apply")
+			return LogEntry{}, ErrLostLeadership
 		}
 		n.applyCond.Wait()
 	}
@@ -145,11 +152,21 @@ func (n *Node) replicatePeer(ctx context.Context, peer string, rpc AppendEntries
 		return
 	}
 
+	// highest commit index this peer has been told about through a successful empty send
+	var sentCommit uint64
 	for {
 		args, term, lastSent, ok := n.nextAppend(peer)
+		commitOnly := uint64(0)
+		if !ok {
+			// caught up, but the peer may not know the latest commit index yet
+			args, term, commitOnly, ok = n.nextCommitUpdate(peer, sentCommit)
+		}
 		if ok {
 			res, err := rpc(ctx, peer, args)
 			if err == nil {
+				if commitOnly > 0 && res.Success {
+					sentCommit = commitOnly
+				}
 				n.handleAppendResult(peer, term, lastSent, len(args.Entries), res)
 				continue
 			}
@@ -228,6 +245,37 @@ func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool)
 	}, n.CurrentTerm, lastSent, true
 }
 
+// build an empty AppendEntries that only carries the leader's commit index.
+// The previous-log check uses matchIndex, so the follower can only commit
+// what it is known to hold. Returns the commit index this send tells the peer about.
+func (n *Node) nextCommitUpdate(peer string, sentCommit uint64) (AppendEntriesArgs, uint64, uint64, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	if n.Role != Leader {
+		return AppendEntriesArgs{}, 0, 0, false
+	}
+	match := n.matchIndex[peer]
+	effective := n.CommitIndex
+	if match < effective {
+		effective = match
+	}
+	if effective == 0 || effective <= sentCommit {
+		return AppendEntriesArgs{}, 0, 0, false
+	}
+	prevTerm, ok := n.logTermAtLocked(match)
+	if !ok {
+		return AppendEntriesArgs{}, 0, 0, false
+	}
+	return AppendEntriesArgs{
+		Term:         n.CurrentTerm,
+		LeaderID:     n.ID,
+		PrevLogIndex: match,
+		PrevLogTerm:  prevTerm,
+		LeaderCommit: n.CommitIndex,
+	}, n.CurrentTerm, effective, true
+}
+
 // read follower response: step down, decrement next index, or update match index and maybe commit
 func (n *Node) handleAppendResult(peer string, term uint64, lastSent uint64, nEntries int, res AppendEntriesResult) {
 	if res.Term > term {
@@ -269,6 +317,13 @@ func (n *Node) advanceCommitLocked() {
 			n.CommitIndex = entry.Index
 			if n.CommitIndex > prev {
 				n.applyCond.Broadcast()
+				// tell followers the new commit index even if they have no new entries
+				for _, ch := range n.peerWake {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
 			}
 			return
 		}

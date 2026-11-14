@@ -19,8 +19,6 @@ Grant a vote only if the candidate’s log is at least as up to date as your own
 If a candidate gets votes from more than half the cluster, it becomes leader.
 Example: in a 3-node cluster, a candidate needs 2 votes.
 
---- current
-
 Stage 5: Let nodes send Raft messages to each other
 Extend the existing peer network so every node can send and receive messages for elections and log updates. Handle timeouts, retries, and duplicate or delayed messages.
 After this stage: nodes can ask for votes and tell peers who the leader is.
@@ -45,6 +43,7 @@ Change the client write path:
 4. The node applies the committed write and replies success.
 5. If the node isn’t leader, it tells the client who the leader is, if known.
 
+-- current
 Stage 10: Check the cluster’s behavior
 Check that elections work, writes wait for a majority, failed nodes can rejoin, and restarted nodes recover their saved data.
 

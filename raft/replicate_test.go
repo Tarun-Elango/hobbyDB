@@ -333,3 +333,40 @@ func newTestLeader(t *testing.T, id string, term uint64, peers []string, log []L
 	}
 	return leader
 }
+
+// After the last write commits, the follower must learn the commit index
+// without waiting for another write.
+func TestFollowerLearnsCommitWithoutNewWrite(t *testing.T) {
+	leader := NewNode("a")
+	follower := NewNode("b")
+	if err := leader.SetPeers([]string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	leader.CurrentTerm, follower.CurrentTerm = 1, 1
+	leader.Role = Leader
+	leader.nextIndex = map[string]uint64{"b": 1}
+	leader.matchIndex = map[string]uint64{"b": 0}
+
+	rpc := func(ctx context.Context, peer string, args AppendEntriesArgs) (AppendEntriesResult, error) {
+		return follower.HandleAppendEntries(args)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunReplication(ctx, rpc)
+	go leader.RunApply(ctx, func(proto.Command) {})
+
+	pctx, pcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer pcancel()
+	if _, err := leader.Propose(pctx, proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if follower.Snapshot().CommitIndex == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("follower commit index = %d, want 1", follower.Snapshot().CommitIndex)
+}

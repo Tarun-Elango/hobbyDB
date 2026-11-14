@@ -32,6 +32,7 @@ type options struct {
 	pprofAddr       string
 	walPath         string
 	peers           string
+	clientPeers     string
 }
 
 func main() {
@@ -52,6 +53,7 @@ func run() error {
 	flag.StringVar(&opts.pprofAddr, "pprof-addr", "", "optional pprof HTTP listen address")
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
 	flag.StringVar(&opts.peers, "peers", "", "comma separated id=host:port pairs")
+	flag.StringVar(&opts.clientPeers, "client-peers", "", "comma separated id=clientHost:port pairs, used to redirect clients to the leader")
 	flag.Parse() // parse the cmd line arguments
 
 	if opts.nodeID == "" {
@@ -150,6 +152,11 @@ func runNode(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("set raft peers: %w", err)
 	}
+	clientAddrs, err := clientAddrMap(opts.nodeID, opts.clientAddr, opts.clientPeers)
+	if err != nil {
+		_ = follower.Close()
+		return err
+	}
 	go raftNode.Run(runCtx, peerSet.RequestVote)              // run the election timer in its own goroutine
 	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)      // run the heartbeat timer in its own goroutine
 	go raftNode.RunReplication(runCtx, peerSet.AppendEntries) // copy the leader log to peers
@@ -164,6 +171,7 @@ func runNode(ctx context.Context, opts options) error {
 			Role:               replication.RoleFollower,
 			FollowerReplicator: follower,
 			RaftNode:           raftNode,
+			ClientAddrs:        clientAddrs,
 		},
 	)
 
@@ -206,6 +214,38 @@ func applyRaftCommand(st *store.Store[string, []byte], cmd proto.Command) {
 	case proto.OpDel:
 		st.Delete(string(cmd.Key))
 	}
+}
+
+// clientAddrMap records where clients can dial each node.
+// This node's own listen address is included so peers that learn its id
+// can be given a matching entry from their own -client-peers list.
+func clientAddrMap(selfID, selfAddr, specs string) (map[string]string, error) {
+	out := make(map[string]string)
+	if selfID != "" {
+		out[selfID] = dialableClientAddr(selfAddr)
+	}
+	for _, spec := range splitNonEmpty(specs) {
+		id, addr, ok := strings.Cut(spec, "=")
+		id = strings.TrimSpace(id)
+		addr = strings.TrimSpace(addr)
+		if !ok || id == "" || addr == "" {
+			return nil, fmt.Errorf("client peer must look like id=host:port, got %q", spec)
+		}
+		out[id] = dialableClientAddr(addr)
+	}
+	return out, nil
+}
+
+// dialableClientAddr turns a listen address into one a client can dial.
+func dialableClientAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
 }
 
 // split a comma separated list of non-empty strings

@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"kvStore/proto"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// How long to wait between passes when every known node is down or electing.
+const redirectPause = 100 * time.Millisecond
 
 /*
 - conn := dial tcp localhost 9000
@@ -18,23 +21,21 @@ import (
 - send func : does a proto.encodecommand/flush or decodeResponse and print
 */
 
-// client that connects to server
+// client that connects to one or more servers and follows the Raft leader.
 func main() {
-	addr, err := serverAddress(os.Args[1:])
+	addrs, err := serverAddresses(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	conn, err := net.Dial("tcp", addr)
+	sess, err := connectAny(addrs)
 	if err != nil {
 		fmt.Println("connect error:", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	defer sess.Close()
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("store> ")
 	for scanner.Scan() { // process input line by line
@@ -46,6 +47,7 @@ func main() {
 			continue
 		}
 
+		var cmd proto.Command
 		switch parts[0] {
 		case "set":
 			if len(parts) != 3 {
@@ -54,35 +56,43 @@ func main() {
 				continue
 			}
 			// []byte(parts[1]) -> 'h' 'e' 'l' 'l' 'o'
-			send(reader, writer, proto.Command{Op: proto.OpSet, Key: []byte(parts[1]), Value: []byte(parts[2])})
+			cmd = proto.Command{Op: proto.OpSet, Key: []byte(parts[1]), Value: []byte(parts[2])}
 		case "get":
 			if len(parts) != 2 {
 				fmt.Println("usage: get <key>")
 				fmt.Print("store> ")
 				continue
 			}
-			send(reader, writer, proto.Command{Op: proto.OpGet, Key: []byte(parts[1])})
+			cmd = proto.Command{Op: proto.OpGet, Key: []byte(parts[1])}
 		case "del":
 			if len(parts) != 2 {
 				fmt.Println("usage: del <key>")
 				fmt.Print("store> ")
 				continue
 			}
-			send(reader, writer, proto.Command{Op: proto.OpDel, Key: []byte(parts[1])})
+			cmd = proto.Command{Op: proto.OpDel, Key: []byte(parts[1])}
 		case "ping":
-			send(reader, writer, proto.Command{Op: proto.OpPing})
+			cmd = proto.Command{Op: proto.OpPing}
 		case "len":
 			if len(parts) != 1 {
 				fmt.Println("usage: len")
 				fmt.Print("store> ")
 				continue
 			}
-			send(reader, writer, proto.Command{Op: proto.OpLen})
+			cmd = proto.Command{Op: proto.OpLen}
 		case "exit", "quit":
 			return
 		default:
 			fmt.Println("unknown command")
+			fmt.Print("store> ")
+			continue
+		}
 
+		resp, err := sess.Do(cmd)
+		if err != nil {
+			fmt.Println("request error:", err)
+		} else {
+			printResponse(resp)
 		}
 		fmt.Print("store> ")
 	}
@@ -91,46 +101,227 @@ func main() {
 	}
 }
 
-func serverAddress(args []string) (string, error) {
+// reads the server addresses from the command line arguments
+func serverAddresses(args []string) ([]string, error) {
 	if len(args) == 0 {
-		return "localhost:9000", nil
-	}
-	if len(args) != 1 || !strings.HasPrefix(args[0], "--") {
-		return "", fmt.Errorf("usage: go run main.go --<port>")
+		return []string{"localhost:9000"}, nil
 	}
 
-	port := strings.TrimPrefix(args[0], "--")
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", fmt.Errorf("invalid port %q; usage: go run main.go --<port>", port)
+	var out []string
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "--") {
+			return nil, fmt.Errorf("usage: go run . [--<port> | --<host:port>]...")
+		}
+		body := strings.TrimPrefix(arg, "--")
+		for _, part := range strings.Split(body, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			addr, err := normalizeServerArg(part)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, addr)
+		}
 	}
-
-	return "localhost:" + port, nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("usage: go run . [--<port> | --<host:port>]...")
+	}
+	return out, nil
 }
 
-// encode, flush, then decode and display the response.
-func send(reader io.Reader, writer *bufio.Writer, command proto.Command) {
-	// first encode command to the bufio writer
-	if err := proto.EncodeCommand(writer, command); err != nil {
-		fmt.Println("encode/write error:", err)
-		return
-	}
-
-	if err := writer.Flush(); err != nil {
-		fmt.Println("flush error:", err)
-		return
-	}
-
-	resp, err := proto.DecodeResponse(reader)
-	if err != nil {
-		if err == io.EOF {
-			fmt.Println("server closed connection")
-			os.Exit(1)
+func normalizeServerArg(part string) (string, error) {
+	if strings.Contains(part, ":") {
+		addr, ok := dialableAddr(part)
+		if !ok {
+			return "", fmt.Errorf("invalid address %q; usage: go run . --<port> or --<host:port>", part)
 		}
-		fmt.Println("decode error:", err)
-		return
+		return addr, nil
 	}
 
+	portNumber, err := strconv.Atoi(part)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("invalid port %q; usage: go run . --<port>", part)
+	}
+	return "localhost:" + part, nil
+}
+
+// session keeps one client connection and the other cluster members it can dial.
+type session struct {
+	members []string
+	conn    net.Conn
+	reader  *bufio.Reader
+	writer  *bufio.Writer
+	current string
+	cursor  int
+}
+
+func connectAny(addrs []string) (*session, error) {
+	sess := &session{members: append([]string(nil), addrs...)}
+	var last error
+	for _, addr := range sess.members {
+		if err := sess.connect(addr); err != nil {
+			last = err
+			continue
+		}
+		return sess, nil
+	}
+	if last == nil {
+		last = fmt.Errorf("no server addresses")
+	}
+	return nil, last
+}
+
+func (s *session) Close() {
+	s.closeConn()
+}
+
+func (s *session) closeConn() {
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+	s.conn = nil
+	s.reader = nil
+	s.writer = nil
+}
+
+func (s *session) connect(addr string) error {
+	s.closeConn()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	s.conn = conn
+	s.reader = bufio.NewReader(conn)
+	s.writer = bufio.NewWriter(conn)
+	s.current = addr
+	s.remember(addr)
+	return nil
+}
+
+func (s *session) remember(addr string) {
+	for _, existing := range s.members {
+		if existing == addr {
+			return
+		}
+	}
+	s.members = append(s.members, addr)
+}
+
+// Do sends one command. Writes follow a NotLeader redirect to the leader's
+// client address, and try the other known members if that leader is gone.
+func (s *session) Do(cmd proto.Command) (proto.Response, error) {
+	write := cmd.Op == proto.OpSet || cmd.Op == proto.OpDel
+	attempts := len(s.members) * 4
+	if attempts < 8 {
+		attempts = 8
+	}
+
+	var lastErr error
+	failed := map[string]bool{}
+	for attempt := 0; attempt < attempts; attempt++ {
+		if s.conn == nil {
+			addr, ok := s.nextAddr(failed)
+			if !ok {
+				failed = map[string]bool{}
+				time.Sleep(redirectPause)
+				addr, ok = s.nextAddr(failed)
+				if !ok {
+					break
+				}
+			}
+			if err := s.connect(addr); err != nil {
+				lastErr = err
+				failed[addr] = true
+				continue
+			}
+		}
+
+		resp, err := s.call(cmd)
+		if err != nil {
+			lastErr = err
+			if s.current != "" {
+				failed[s.current] = true
+			}
+			s.closeConn()
+			continue
+		}
+		if !write || resp.Status != proto.StatusNotLeader {
+			return resp, nil
+		}
+
+		hint := strings.TrimSpace(string(resp.Value))
+		addr, ok := dialableAddr(hint)
+		if ok && addr != s.current && !failed[addr] {
+			fmt.Printf("switching to leader %s\n", addr)
+			s.closeConn()
+			if err := s.connect(addr); err != nil {
+				lastErr = err
+				failed[addr] = true
+				continue
+			}
+			continue
+		}
+		if s.current != "" {
+			failed[s.current] = true
+		}
+		s.closeConn()
+		if hint == "" {
+			time.Sleep(redirectPause)
+		}
+	}
+	if lastErr != nil {
+		return proto.Response{}, lastErr
+	}
+	return proto.Response{Status: proto.StatusNotLeader}, nil
+}
+
+func (s *session) nextAddr(failed map[string]bool) (string, bool) {
+	if len(s.members) == 0 {
+		return "", false
+	}
+	for i := 0; i < len(s.members); i++ {
+		addr := s.members[s.cursor%len(s.members)]
+		s.cursor++
+		if !failed[addr] {
+			return addr, true
+		}
+	}
+	return "", false
+}
+
+func (s *session) call(cmd proto.Command) (proto.Response, error) {
+	if err := proto.EncodeCommand(s.writer, cmd); err != nil {
+		return proto.Response{}, err
+	}
+	if err := s.writer.Flush(); err != nil {
+		return proto.Response{}, err
+	}
+	resp, err := proto.DecodeResponse(s.reader)
+	if err != nil {
+		return proto.Response{}, err
+	}
+	return resp, nil
+}
+
+// dialableAddr reports whether hint is host:port rather than a node id.
+func dialableAddr(hint string) (string, bool) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(hint))
+	if err != nil || port == "" {
+		return "", false
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", false
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port), true
+}
+
+func printResponse(resp proto.Response) {
 	switch resp.Status {
 	case proto.StatusOk:
 		if len(resp.Value) > 0 {
@@ -138,7 +329,6 @@ func send(reader io.Reader, writer *bufio.Writer, command proto.Command) {
 		} else {
 			fmt.Println("OK")
 		}
-		// fmt.Println("Completed command")
 	case proto.StatusNotFound:
 		fmt.Println("key not found")
 	case proto.StatusError:
@@ -148,7 +338,11 @@ func send(reader io.Reader, writer *bufio.Writer, command proto.Command) {
 			fmt.Println("server error (no details provided)")
 		}
 	case proto.StatusNotLeader:
-		fmt.Printf("not leader; use %s\n", string(resp.Value))
+		if len(resp.Value) == 0 {
+			fmt.Println("not leader; leader unknown")
+		} else {
+			fmt.Printf("not leader; leader is %s\n", string(resp.Value))
+		}
 	default:
 		fmt.Println("unknown response status")
 	}

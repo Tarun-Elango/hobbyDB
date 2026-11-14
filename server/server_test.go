@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"kvStore/proto"
+	"kvStore/raft"
 	"kvStore/store"
 	"kvStore/wal"
 	"net"
@@ -32,7 +33,7 @@ func newTestServer(t *testing.T) *Server {
 func TestDispatch(t *testing.T) {
 	s := newTestServer(t)
 
-	response, err := s.dispatch(proto.Command{Op: proto.OpGet, Key: []byte("missing")})
+	response, err := s.dispatch(context.Background(), proto.Command{Op: proto.OpGet, Key: []byte("missing")})
 	if err != nil {
 		t.Fatalf("GET failed: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestDispatch(t *testing.T) {
 	}
 
 	// SET persists bytes, and GET returns those exact bytes.
-	response, err = s.dispatch(
+	response, err = s.dispatch(context.Background(),
 		proto.Command{
 			Op:    proto.OpSet,
 			Key:   []byte("language"),
@@ -51,35 +52,35 @@ func TestDispatch(t *testing.T) {
 		t.Fatalf("SET status = %d, want %d", response.Status, proto.StatusOk)
 	}
 
-	response, err = s.dispatch(proto.Command{Op: proto.OpLen, Key: []byte("language")})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: proto.OpLen, Key: []byte("language")})
 	if response.Status != proto.StatusOk || string(response.Value) != "1" {
 		t.Fatalf("LEN response = %#v, want OK with value %q", response, "1")
 	}
 
 	// DELETE removes the key; a later GET must report it as absent.
-	response, err = s.dispatch(proto.Command{Op: proto.OpDel, Key: []byte("language")})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: proto.OpDel, Key: []byte("language")})
 	if response.Status != proto.StatusOk {
 		t.Fatalf("DEL status = %d, want %d", response.Status, proto.StatusOk)
 	}
-	response, err = s.dispatch(proto.Command{Op: proto.OpGet, Key: []byte("language")})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: proto.OpGet, Key: []byte("language")})
 	if response.Status != proto.StatusNotFound {
 		t.Fatalf("GET after DEL status = %d, want %d", response.Status, proto.StatusNotFound)
 	}
 
 	// PING has no store side effect and always acknowledges the client.
-	response, err = s.dispatch(proto.Command{Op: proto.OpPing})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: proto.OpPing})
 	if response.Status != proto.StatusOk {
 		t.Fatalf("PING status = %d, want %d", response.Status, proto.StatusOk)
 	}
 
 	// LEN reflects the current number of keys, not the total number of writes.
-	response, err = s.dispatch(proto.Command{Op: proto.OpLen})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: proto.OpLen})
 	if response.Status != proto.StatusOk || string(response.Value) != "0" {
 		t.Fatalf("LEN response = %#v, want OK with value %q", response, "0")
 	}
 
 	// unknown opcode
-	response, err = s.dispatch(proto.Command{Op: 99})
+	response, err = s.dispatch(context.Background(), proto.Command{Op: 99})
 	if response.Status != proto.StatusError {
 		t.Fatalf("unknown opcode status = %d, want %d", response.Status, proto.StatusError)
 	}
@@ -99,7 +100,7 @@ func TestHanldeConnMultipleCommands(t *testing.T) {
 	// send error to done channel
 	// closes after handling finishes
 	go func() {
-		done <- s.handleConn(serverConn)
+		done <- s.handleConn(context.Background(), serverConn)
 		_ = serverConn.Close()
 	}()
 
@@ -149,7 +150,7 @@ func TestHandleConnRejectsMalformedRequest(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		done <- s.handleConn(serverConn)
+		done <- s.handleConn(context.Background(), serverConn)
 		_ = serverConn.Close()
 	}()
 
@@ -206,5 +207,105 @@ func TestShutdownStopsActiveHandler(t *testing.T) {
 	}
 	if !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("write after shutdown error = %v, want io.ErrClosedPipe", err)
+	}
+}
+
+func TestRaftFollowerWriteReturnsLeader(t *testing.T) {
+	node := raft.NewNode("b")
+	node.Role = raft.Follower
+	node.LeaderID = "a"
+	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{RaftNode: node})
+
+	response, err := s.dispatch(context.Background(), proto.Command{
+		Op: proto.OpSet, Key: []byte("k"), Value: []byte("v"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != proto.StatusNotLeader || string(response.Value) != "a" {
+		t.Fatalf("response = %#v, want NotLeader leader a", response)
+	}
+	if _, ok := s.store.Get("k"); ok {
+		t.Fatal("follower stored the write")
+	}
+}
+
+func TestRaftFollowerWriteReturnsLeaderAddress(t *testing.T) {
+	node := raft.NewNode("b")
+	node.Role = raft.Follower
+	node.LeaderID = "a"
+	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{
+		RaftNode:    node,
+		ClientAddrs: map[string]string{"a": "127.0.0.1:9000"},
+	})
+
+	response, err := s.dispatch(context.Background(), proto.Command{
+		Op: proto.OpSet, Key: []byte("k"), Value: []byte("v"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != proto.StatusNotLeader || string(response.Value) != "127.0.0.1:9000" {
+		t.Fatalf("response = %#v, want NotLeader 127.0.0.1:9000", response)
+	}
+}
+
+func TestRaftFollowerWriteLeaderUnknown(t *testing.T) {
+	node := raft.NewNode("b")
+	node.Role = raft.Candidate
+	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{RaftNode: node})
+
+	response, err := s.dispatch(context.Background(), proto.Command{
+		Op: proto.OpDel, Key: []byte("k"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != proto.StatusNotLeader || len(response.Value) != 0 {
+		t.Fatalf("response = %#v, want NotLeader with no leader id", response)
+	}
+}
+
+func TestRaftLeaderWriteRepliesAfterApply(t *testing.T) {
+	node := raft.NewNode("a")
+	node.Role = raft.Leader
+	node.CurrentTerm = 1
+	st := store.NewStore[string, []byte]()
+	s := NewWithConfig(st, nil, &Config{RaftNode: node})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go node.RunApply(ctx, func(cmd proto.Command) {
+		switch cmd.Op {
+		case proto.OpSet:
+			st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+		case proto.OpDel:
+			st.Delete(string(cmd.Key))
+		}
+	})
+
+	response, err := s.dispatch(ctx, proto.Command{
+		Op: proto.OpSet, Key: []byte("k"), Value: []byte("v"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != proto.StatusOk {
+		t.Fatalf("SET status = %d, want OK", response.Status)
+	}
+	got, ok := st.Get("k")
+	if !ok || string(got) != "v" {
+		t.Fatalf("store = %q ok=%v, want v", got, ok)
+	}
+
+	response, err = s.dispatch(ctx, proto.Command{Op: proto.OpDel, Key: []byte("k")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != proto.StatusOk {
+		t.Fatalf("DEL status = %d, want OK", response.Status)
+	}
+	if _, ok := st.Get("k"); ok {
+		t.Fatal("key still present after DEL")
 	}
 }
