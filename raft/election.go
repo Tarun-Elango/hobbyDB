@@ -81,9 +81,12 @@ func (n *Node) Run(ctx context.Context, rpc VoteRPC) {
 			}
 			timer.Reset(randomElectionTimeout())
 		case <-timer.C:
-			if n.Snapshot().Role != Leader {
-				_ = n.startElection(ctx, rpc) // start a new election
+			if n.Snapshot().Role == Leader {
+				// leaders don't run elections: leave the timer stopped.
+				// every leader -> follower transition pokes electionReset to re-arm it.
+				continue
 			}
+			_ = n.startElection(ctx, rpc) // start a new election
 			timer.Reset(randomElectionTimeout())
 		}
 	}
@@ -261,6 +264,11 @@ func (n *Node) becomeLeader(term uint64) {
 		}
 	}
 
+	select { // start the heartbeat stint for this term
+	case n.leaderWake <- struct{}{}:
+	default:
+	}
+
 	// assume every peer if caught up, fail append will walk back until logs meet
 }
 
@@ -328,9 +336,13 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 	}
 
 	n.mu.Lock()
+	wasLeader := n.Role == Leader
 	if n.CurrentTerm == term {
 		n.Role = Follower
 		n.LeaderID = "" // dont knwo for sure, hence will update later
+	}
+	if wasLeader && n.Role != Leader {
+		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
 	}
 	granted := n.CurrentTerm == term && n.VotedFor == candidateId // if the vote is for the candidate and the term is the same
 	termNow := n.CurrentTerm
@@ -341,11 +353,36 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 	}, nil
 }
 
-// send heartbeats to peers in a goroutine
+// send heartbeats to peers, only while this node is leader.
+// idles until becomeLeader pokes leaderWake, runs one stint per leader term.
 func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
-	peers := n.peerIds()
+	for {
+		snap := n.Snapshot()
+		if snap.Role == Leader && rpc != nil {
+			n.heartbeatStint(ctx, rpc, snap.CurrentTerm)
+			continue // maybe leader again in a newer term; re-check before idling
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.leaderWake:
+		}
+	}
+}
+
+// heartbeat every peer until ctx ends or this node stops leading `term`.
+// the first heartbeat goes out immediately, then one per tick.
+func (n *Node) heartbeatStint(ctx context.Context, rpc HeartbeatRPC, term uint64) {
+	stintCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	leading := func() bool {
+		s := n.Snapshot()
+		return s.Role == Leader && s.CurrentTerm == term
+	}
+
 	var wg sync.WaitGroup
-	for _, peer := range peers {
+	for _, peer := range n.peerIds() {
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
@@ -353,27 +390,30 @@ func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
 			defer ticker.Stop()
 
 			for {
+				if !leading() {
+					return
+				}
+				res, err := rpc(stintCtx, peer, HeartbeatArgs{Term: term, LeaderID: n.ID})
+				if err == nil && res.Term > term {
+					_ = n.stepDown(res.Term)
+					return
+				}
 				select {
-				case <-ctx.Done():
+				case <-stintCtx.Done():
 					return
 				case <-ticker.C:
-					snap := n.Snapshot()
-					if snap.Role != Leader || rpc == nil {
-						continue
-					}
-					res, err := rpc(ctx, peer, HeartbeatArgs{
-						Term:     snap.CurrentTerm,
-						LeaderID: snap.LeaderID,
-					})
-					if err != nil {
-						continue
-					}
-					if res.Term > snap.CurrentTerm {
-						_ = n.stepDown(res.Term)
-					}
 				}
 			}
 		}(peer)
 	}
 	wg.Wait()
+
+	// no peers (single node): nothing to send, so wait out the leadership instead of spinning
+	for leading() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(electionTimeoutMin / 3):
+		}
+	}
 }

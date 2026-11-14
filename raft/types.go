@@ -39,6 +39,7 @@ type Node struct {
 	LeaderID      string
 	peers         []string
 	electionReset chan struct{}
+	leaderWake    chan struct{} // poked by becomeLeader to start the heartbeat stint
 
 	// ---- leader (log replication) ----
 	nextIndex  map[string]uint64        // next log index to send to each peer
@@ -88,6 +89,7 @@ func NewNode(id string) *Node {
 		Role:          Follower,
 		Log:           make([]LogEntry, 0),
 		electionReset: make(chan struct{}, 1),
+		leaderWake:    make(chan struct{}, 1),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n

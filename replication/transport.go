@@ -453,7 +453,7 @@ func (s *ReplicationServer) Serve() error {
 
 		s.mu.Unlock()
 
-		go s.serveConnection(conn)
+		go s.serveConnection(conn) // spawn a new goroutine to serve the connection
 	}
 }
 

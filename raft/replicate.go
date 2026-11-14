@@ -367,6 +367,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 	n.LeaderID = args.LeaderID
 	if wasLeader {
 		n.applyCond.Broadcast()
+		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
 	}
 
 	prevTerm, ok := n.logTermAtLocked(args.PrevLogIndex)
