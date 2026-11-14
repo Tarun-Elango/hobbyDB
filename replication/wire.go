@@ -1,5 +1,7 @@
 package replication
 
+import "kvStore/config"
+
 const (
 	messageProtocol byte = 1
 
@@ -13,9 +15,10 @@ const (
 
 	messageRaftAppendEntries    byte = 7
 	messageRaftAppendEntriesRes byte = 8
-
-	maxReplicationFrame = 64 << 20 // 64 * 2^20 = 64 MB ( max message size )
 )
+
+// max message size
+var maxReplicationFrame = config.Int("replication.max.frame")
 
 /*
 u32 frame length

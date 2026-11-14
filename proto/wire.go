@@ -1,6 +1,9 @@
 package proto
 
-import "errors"
+import (
+	"errors"
+	"kvStore/config"
+)
 
 // opcodes
 const (
@@ -22,9 +25,9 @@ const (
 	StatusNotLeader byte = 3
 )
 
-const (
-	MaxKeyLen   = 65535            // uint16 max (65,535 bytes)
-	MaxValueLen = 16 * 1024 * 1024 // 16 MB - uint32, 16 mil bytes = 16 Mb ( uint32 can hold the number 16 mil)
+var (
+	MaxKeyLen   = config.Int("proto.max.key.len")
+	MaxValueLen = config.Int("proto.max.value.len")
 )
 
 var (

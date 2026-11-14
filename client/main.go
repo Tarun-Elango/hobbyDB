@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"kvStore/config"
 	"kvStore/proto"
 	"net"
 	"os"
@@ -12,10 +13,10 @@ import (
 )
 
 // How long to wait between passes when every known node is down or electing.
-const (
-	redirectPause = 100 * time.Millisecond
-	retryWindow   = 5 * time.Second
-	dialTimeout   = time.Second
+var (
+	redirectPause = config.Duration("client.redirect.pause.ms")
+	retryWindow   = config.Duration("client.retry.window.ms")
+	dialTimeout   = config.Duration("client.dial.timeout.ms")
 )
 
 /*

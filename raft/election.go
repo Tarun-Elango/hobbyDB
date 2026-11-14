@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"kvStore/config"
 	"kvStore/logx"
 	"kvStore/proto"
 	"math/rand/v2"
@@ -9,9 +10,9 @@ import (
 	"time"
 )
 
-const (
-	electionTimeoutMin = 150 * time.Millisecond
-	electionTimeoutMax = 300 * time.Millisecond
+var (
+	electionTimeoutMin = config.Duration("raft.election.timeout.min.ms")
+	electionTimeoutMax = config.Duration("raft.election.timeout.max.ms")
 )
 
 type HeartbeatArgs struct {

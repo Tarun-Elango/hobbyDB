@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"kvStore/config"
 	"kvStore/logx"
 	"sync"
 	"time"
@@ -11,14 +12,14 @@ import (
 
 var ErrReplicationConflict = errors.New("replication: follower log conflict")
 
-const (
-	replicationBatchSize = 64
-	initialRetryBackoff  = 50 * time.Millisecond
-	maxRetryBackoff      = 2 * time.Second
-	rpcTimeout           = 5 * time.Second
+var (
+	replicationBatchSize = config.Int("replication.batch.size")
+	initialRetryBackoff  = config.Duration("replication.retry.backoff.initial.ms")
+	maxRetryBackoff      = config.Duration("replication.retry.backoff.max.ms")
+	rpcTimeout           = config.Duration("replication.rpc.timeout.ms")
 )
 
-const maxAppendPayloadSize = maxReplicationFrame - 2 // protocol byte + message-type byte
+var maxAppendPayloadSize = maxReplicationFrame - 2 // protocol byte + message-type byte
 
 func encodedReplicationEntrySize(entry Entry) int {
 	// index + term + op + key length + key + value length + value

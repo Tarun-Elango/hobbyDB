@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kvStore/config"
 	"kvStore/proto"
 	"math"
 )
@@ -17,13 +18,13 @@ import (
 // message payload
 //
 
-const (
-	maxLeaderIDLength     = 256
-	maxErrorMessageLength = 64 << 10
-	maxEntriesPerRequest  = 1024
+var (
+	maxLeaderIDLength     = config.Int("replication.max.leader.id.len")
+	maxErrorMessageLength = config.Int("replication.max.error.message.len")
+	maxEntriesPerRequest  = config.Int("replication.max.entries.per.request")
 )
 
-const maxAppendRequestPayload = maxReplicationFrame - 2 // max payload 64MiB -2 bytes
+var maxAppendRequestPayload = maxReplicationFrame - 2 // max payload 64MiB -2 bytes
 
 // -2 because the frame also contains:
 // 1 byte protocol version + 1 byte message type
@@ -164,7 +165,7 @@ func decodeAppendRequestPayload(payload []byte) (AppendRequest, error) {
 		)
 	}
 
-	if leaderIDLength > maxLeaderIDLength {
+	if int(leaderIDLength) > maxLeaderIDLength {
 		return AppendRequest{}, errors.New("leader ID is too long")
 	}
 
@@ -221,7 +222,7 @@ func decodeAppendRequestPayload(payload []byte) (AppendRequest, error) {
 			err,
 		)
 	}
-	if entryCount > maxEntriesPerRequest {
+	if int(entryCount) > maxEntriesPerRequest {
 		return AppendRequest{}, fmt.Errorf(
 			"too many entries: got %d max %d",
 			entryCount,
@@ -374,7 +375,7 @@ func DecodeAppendResponse(r io.Reader) (AppendResponse, error) {
 			err,
 		)
 	}
-	if errorLength > maxErrorMessageLength {
+	if int(errorLength) > maxErrorMessageLength {
 		return AppendResponse{}, errors.New(
 			"error message is too long",
 		)
@@ -462,7 +463,7 @@ func decodeEntry(r io.Reader) (Entry, error) {
 	if err != nil {
 		return Entry{}, fmt.Errorf("read key length: %w", err)
 	}
-	if keyLength > proto.MaxKeyLen {
+	if int(keyLength) > proto.MaxKeyLen {
 		return Entry{}, fmt.Errorf(
 			"key is too large: got %d max %d",
 			keyLength,
@@ -478,7 +479,7 @@ func decodeEntry(r io.Reader) (Entry, error) {
 		return Entry{}, fmt.Errorf("read value length: %w", err)
 	}
 
-	if valueLength > proto.MaxValueLen {
+	if int(valueLength) > proto.MaxValueLen {
 		return Entry{}, fmt.Errorf(
 			"value is too large: got %d max %d",
 			valueLength,

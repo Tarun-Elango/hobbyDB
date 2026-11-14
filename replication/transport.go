@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"kvStore/config"
 	"kvStore/logx"
 	"kvStore/raft"
 	"net"
@@ -13,9 +14,9 @@ import (
 	"time"
 )
 
-const (
-	rpcAttemptTimeout = 80 * time.Millisecond
-	rpcAttempts       = 3
+var (
+	rpcAttemptTimeout = config.Duration("replication.rpc.attempt.timeout.ms")
+	rpcAttempts       = config.Int("replication.rpc.attempts")
 )
 
 type PeerClient interface {

@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"kvStore/config"
 	"kvStore/proto"
 	"sync"
 	"time"
@@ -15,10 +16,10 @@ var (
 	ErrLostLeadership = errors.New("lost leadership before apply")
 )
 
-const (
-	appendEntriesBatchLimit = 64
-	maxAppendEntriesPayload = 64<<20 - 2
-	appendRetryBackoff      = 50 * time.Millisecond
+var (
+	appendEntriesBatchLimit = config.Int("raft.append.entries.batch.limit")
+	maxAppendEntriesPayload = config.Int("raft.append.entries.max.payload")
+	appendRetryBackoff      = config.Duration("raft.append.retry.backoff.ms")
 )
 
 // AppendEntries RPC: leader copies log entries to peers and reports its commit index.

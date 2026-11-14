@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"kvStore/config"
 )
 
 type Op byte
@@ -26,15 +27,15 @@ type Record struct {
 	Value []byte
 }
 
-const (
-	MaxKeyLen   = 65535            // uint16 max (65,535 bytes)
-	MaxValueLen = 16 * 1024 * 1024 // 16 MB - uint32, 16 mil bytes = 16 Mb ( uint32 can hold the number 16 mil)
+var (
+	MaxKeyLen   = config.Int("proto.max.key.len")
+	MaxValueLen = config.Int("proto.max.value.len")
 )
 
 // maxRecordLen guards against a corrupted or bogus length prefix causing
 // a huge allocation. Generous upper bound on payload size:
 // 8 (index) + 8 (term) + 1 (op) + 4 (keyLen) + MaxKeyLen + 4 (valLen) + MaxValueLen
-const maxRecordLen = 8 + 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen
+var maxRecordLen = 8 + 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen
 
 var (
 	ErrUnknownOp        = errors.New("wal: unknown operation")
@@ -107,7 +108,7 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		// some but not all 4 length-prefix bytes were present
 		return Record{}, ErrIncompleteRecord
 	}
-	if recordLen > maxRecordLen {
+	if int(recordLen) > maxRecordLen {
 		return Record{}, fmt.Errorf("%w: record length %d exceeds max %d",
 			ErrChecksumMismatch, recordLen, maxRecordLen)
 	}
@@ -169,7 +170,7 @@ func decodePayload(payload []byte) (Record, error) {
 	if err != nil {
 		return Record{}, ErrIncompleteRecord
 	}
-	if keyLen > MaxKeyLen {
+	if int(keyLen) > MaxKeyLen {
 		// validate before allocating
 		return Record{}, ErrKeyTooLarge
 	}
@@ -182,7 +183,7 @@ func decodePayload(payload []byte) (Record, error) {
 	if err != nil {
 		return Record{}, ErrIncompleteRecord
 	}
-	if valLen > MaxValueLen {
+	if int(valLen) > MaxValueLen {
 		// validate before allocating
 		return Record{}, ErrValueTooLarge
 	}

@@ -223,7 +223,7 @@ func DecodeRaftAppendEntriesPayload(payload []byte) (raft.AppendEntriesArgs, err
 	if err != nil {
 		return raft.AppendEntriesArgs{}, err
 	}
-	if count > maxEntriesPerRequest {
+	if int(count) > maxEntriesPerRequest {
 		return raft.AppendEntriesArgs{}, fmt.Errorf("replication: too many entries: %d", count)
 	}
 	entries := make([]raft.LogEntry, count)
@@ -327,7 +327,7 @@ func decodeRaftLogEntry(r io.Reader) (raft.LogEntry, error) {
 	if err != nil {
 		return raft.LogEntry{}, err
 	}
-	if keyLen > proto.MaxKeyLen {
+	if int(keyLen) > proto.MaxKeyLen {
 		return raft.LogEntry{}, fmt.Errorf("replication: key is too large: %d", keyLen)
 	}
 	key, err := readBytes(r, keyLen)
@@ -338,7 +338,7 @@ func decodeRaftLogEntry(r io.Reader) (raft.LogEntry, error) {
 	if err != nil {
 		return raft.LogEntry{}, err
 	}
-	if valueLen > proto.MaxValueLen {
+	if int(valueLen) > proto.MaxValueLen {
 		return raft.LogEntry{}, fmt.Errorf("replication: value is too large: %d", valueLen)
 	}
 	value, err := readBytes(r, valueLen)

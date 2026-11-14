@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kvStore/config"
 	"kvStore/logx"
 	"kvStore/proto"
 	"kvStore/raft"
@@ -19,7 +20,7 @@ import (
 )
 
 // How long a client write waits for Raft to copy it to a majority and apply it.
-const raftProposeTimeout = 5 * time.Second
+var raftProposeTimeout = config.Duration("server.raft.propose.timeout.ms")
 
 // config from user input, to set the server state like role, addr
 type Config struct {
@@ -83,15 +84,15 @@ func NewWithConfig(
 	}
 
 	return &Server{
-		store:              st,
-		log:                log,
-		role:               cfg.Role,
-		leaderAddr:         cfg.LeaderAddr,
-		nextIndex:          cfg.NextIndex,
+		store:            st,
+		log:              log,
+		role:             cfg.Role,
+		leaderAddr:       cfg.LeaderAddr,
+		nextIndex:        cfg.NextIndex,
 		leaderReplicator: cfg.LeaderReplicator,
 		connections:      make(map[net.Conn]struct{}),
-		raftNode:           cfg.RaftNode,
-		clientAddrs:        copyClientAddrs(cfg.ClientAddrs),
+		raftNode:         cfg.RaftNode,
+		clientAddrs:      copyClientAddrs(cfg.ClientAddrs),
 	}
 }
 

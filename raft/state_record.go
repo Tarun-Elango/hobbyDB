@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kvStore/config"
 )
 
 const stateFormatVersion byte = 1
 
 // MaxVotedForLen matches replication leader/candidate ID limits.
-const MaxVotedForLen = 256
+var MaxVotedForLen = config.Int("raft.max.voted.for.len")
 
 var (
 	ErrUnsupportedStateVersion = errors.New("raft: unsupported persistent state version")
@@ -68,7 +69,7 @@ func DecodePersistentState(data []byte) (PersistentState, error) {
 	if err != nil {
 		return PersistentState{}, fmt.Errorf("%w: %v", ErrMalformedState, err)
 	}
-	if votedForLen > MaxVotedForLen {
+	if int(votedForLen) > MaxVotedForLen {
 		return PersistentState{}, ErrVotedForTooLong
 	}
 
