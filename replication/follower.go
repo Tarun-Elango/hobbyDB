@@ -53,7 +53,7 @@ func NewFollower(
 		entries:  make(map[uint64]Entry),
 	}
 
-	logx.Printf("Creating follower and replaying log\n")
+	logx.Printf("Creating this node as a follower and replaying log to\n")
 	err = log.Replay(func(rec wal.Record) error {
 		entry, err := recordToEntry(rec) // record to entry
 		if err != nil {

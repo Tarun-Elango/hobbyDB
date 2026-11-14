@@ -1,7 +1,6 @@
 package replication
 
-// This file moves replication messages between leader and follower over TCP.
-// In simple terms: the leader sends a write, and the follower sends back an answer.
+// Peer TCP transport for Raft RPCs (RequestVote, AppendEntries, heartbeat).
 
 import (
 	"context"
@@ -348,7 +347,6 @@ func (c *TCPPeerClient) AppendEntries(
 // replication server owns replication listener and all peer connections
 type ReplicationServer struct {
 	listener net.Listener
-	follower *Follower
 	raftNode *raft.Node
 
 	ctx    context.Context
@@ -367,7 +365,6 @@ type ReplicationServer struct {
 func NewReplicationServer(
 	ctx context.Context,
 	addr string,
-	follower *Follower,
 	raftNode *raft.Node,
 ) (*ReplicationServer, error) {
 	if ctx == nil {
@@ -375,9 +372,6 @@ func NewReplicationServer(
 	}
 	if raftNode == nil {
 		return nil, errors.New("replication: raft node cannot be nil")
-	}
-	if follower == nil {
-		return nil, errors.New("replication: follower cannot be nil")
 	}
 	if addr == "" {
 		return nil, errors.New("replication: listen address cannot be empty")
@@ -398,7 +392,6 @@ func NewReplicationServer(
 
 	server := &ReplicationServer{
 		listener:    listener,
-		follower:    follower,
 		raftNode:    raftNode,
 		ctx:         serverCtx,
 		cancel:      cancel,
@@ -475,7 +468,7 @@ func (s *ReplicationServer) serveConnection(conn net.Conn) {
 		s.wg.Done()
 	}()
 
-	serveReplicationConnection(s.ctx, conn, s.follower, s.raftNode)
+	serveReplicationConnection(s.ctx, conn, s.raftNode)
 }
 
 // stop accepting connections and close all peer connections
@@ -516,23 +509,11 @@ func (s *ReplicationServer) isClosed() bool {
 	return s.closed
 }
 
-// ServerReplication is kept as a compatibility wrapper.
-func ServerReplication(conn net.Conn, follower *Follower) {
-	ServeReplication(conn, follower)
-}
-
-// ServeReplication is the standalone connection handler required by replication
-// transport api
-func ServeReplication(conn net.Conn, follower *Follower) {
-	serveReplicationConnection(context.Background(), conn, follower, nil)
-}
-
 // follower side loop for 1 tcp connection ( handle 1 tcp conn)
 // listen for request from the same leader conn
 func serveReplicationConnection(
 	ctx context.Context,
 	conn net.Conn,
-	follower *Follower,
 	raftNode *raft.Node,
 ) {
 	if conn == nil {
@@ -558,26 +539,7 @@ func serveReplicationConnection(
 		}
 		switch frame.messageType {
 		case messageAppendRequest:
-			req, err := decodeAppendRequestPayload(frame.payload)
-			if err != nil {
-				_ = EncodeAppendResponse(conn, AppendResponse{
-					Success: false,
-					Code:    AppendErrorInvalid,
-					Error:   fmt.Sprintf("decode append request: %v", err),
-				})
-				return
-			}
-			if follower == nil {
-				_ = EncodeAppendResponse(conn, AppendResponse{
-					Success: false,
-					Code:    AppendErrorInternal,
-					Error:   "replication: nil follower",
-				})
-				return
-			}
-			if err := EncodeAppendResponse(conn, follower.ApplyAppend(req)); err != nil {
-				return
-			}
+			return
 		case messageRequestVote:
 			if raftNode == nil {
 				return

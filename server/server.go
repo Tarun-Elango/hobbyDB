@@ -27,9 +27,8 @@ type Config struct {
 	LeaderAddr string
 	NextIndex  uint64
 
-	LeaderReplicator   *replication.Leader
-	FollowerReplicator *replication.Follower
-	RaftNode           *raft.Node
+	LeaderReplicator *replication.Leader
+	RaftNode         *raft.Node
 	// ClientAddrs maps a Raft node id to the address clients dial.
 	// A follower uses it to redirect writes to the current leader.
 	ClientAddrs map[string]string
@@ -46,8 +45,7 @@ type Server struct {
 	leaderAddr string
 	nextIndex  uint64
 
-	leaderReplicator   *replication.Leader
-	followerReplicator *replication.Follower
+	leaderReplicator *replication.Leader
 
 	writeMu  sync.Mutex //serialize index allocation
 	writeErr error      // first WAL append/sync failure; protected by writeMu
@@ -90,9 +88,8 @@ func NewWithConfig(
 		role:               cfg.Role,
 		leaderAddr:         cfg.LeaderAddr,
 		nextIndex:          cfg.NextIndex,
-		leaderReplicator:   cfg.LeaderReplicator,
-		followerReplicator: cfg.FollowerReplicator,
-		connections:        make(map[net.Conn]struct{}),
+		leaderReplicator: cfg.LeaderReplicator,
+		connections:      make(map[net.Conn]struct{}),
 		raftNode:           cfg.RaftNode,
 		clientAddrs:        copyClientAddrs(cfg.ClientAddrs),
 	}
@@ -198,10 +195,6 @@ func (s *Server) shutdown() {
 
 		if s.leaderReplicator != nil {
 			s.leaderReplicator.Close()
-		}
-
-		if s.followerReplicator != nil {
-			_ = s.followerReplicator.Close()
 		}
 
 		s.logCloseOnce.Do(func() {

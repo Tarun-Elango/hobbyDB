@@ -104,38 +104,29 @@ func run() error {
 
 }
 
-// runNode boots one cluster member as a follower:
-// - NewStore: empty in-memory KV
-// - NewFollower: open WAL and replay into the store (no leader pinned yet)
+// runNode boots one cluster member:
+// - NewStore: empty in-memory KV (Raft RunApply fills it from committed entries)
 // - runCtx: cancellable context to stop raft, replication, and client together
 // - NewReplicationServer: bind replication TCP (does not accept until Serve)
 // - OpenNode + SetPeers + go Run: load Raft state, register peers, start elections
-// - NewWithConfig: wire client HTTP server (WAL owned by Follower)
+// - NewWithConfig: wire client TCP server with Raft
 // - go RunApply: apply committed raft entries to the store, in order
-// - go peerServer.Serve: accept leader replication and apply via Follower
+// - go peerServer.Serve: accept peer Raft RPCs (votes, append, heartbeat)
 // - srv.Serve: block serving client requests until shutdown
-// - cleanup: cancel, close replication and follower, surface errors
 func runNode(ctx context.Context, opts options) error {
 	st := store.NewStore[string, []byte]()
-
-	// replay the wal into the store, nobody leader yet
-	follower, err := replication.NewFollower(opts.walPath, st, "")
-	if err != nil {
-		return fmt.Errorf("create follower: %w", err)
-	}
+	logx.Printf("INFO: creating empty store for this node %s", opts.nodeID)
 
 	runCtx, cancel := context.WithCancel(ctx) // child context for the node, so we can cancel it if needed
 	defer cancel()
 	// open raft node
 	raftNode, err := raft.OpenNode(opts.nodeID, opts.walPath+"-raft.state")
 	if err != nil {
-		_ = follower.Close()
 		return fmt.Errorf("open raft node: %w", err)
 	}
 	// load the durable raft log; committed entries are re-applied to the store
 	// by RunApply once a leader (or its no-op) commits them
 	if err := raftNode.OpenLog(opts.walPath + "-raft.log"); err != nil {
-		_ = follower.Close()
 		return err
 	}
 	defer raftNode.CloseLog()
@@ -143,29 +134,24 @@ func runNode(ctx context.Context, opts options) error {
 	peerServer, err := replication.NewReplicationServer(
 		runCtx,
 		opts.replicationAddr,
-		follower,
 		raftNode,
 	)
 	if err != nil {
-		_ = follower.Close()
 		return fmt.Errorf("create replication server: %w", err)
 	}
 
 	peerSet, err := replication.NewPeerSet(splitNonEmpty(opts.peers))
 	if err != nil {
-		_ = follower.Close()
 		return err
 	}
 	defer peerSet.Close()
 
 	//peersIds := splitNonEmpty(opts.peers)
 	if err := raftNode.SetPeers(peerSet.IDs()); err != nil {
-		_ = follower.Close()
 		return fmt.Errorf("set raft peers: %w", err)
 	}
 	clientAddrs, err := clientAddrMap(opts.nodeID, opts.clientAddr, opts.clientPeers)
 	if err != nil {
-		_ = follower.Close()
 		return err
 	}
 	go raftNode.Run(runCtx, peerSet.RequestVote)              // run the election timer in its own goroutine
@@ -177,12 +163,11 @@ func runNode(ctx context.Context, opts options) error {
 
 	srv := server.NewWithConfig(
 		st,
-		nil, // wal owned by replication.Follower
+		nil,
 		&server.Config{
-			Role:               replication.RoleFollower,
-			FollowerReplicator: follower,
-			RaftNode:           raftNode,
-			ClientAddrs:        clientAddrs,
+			Role:        replication.RoleFollower,
+			RaftNode:    raftNode,
+			ClientAddrs: clientAddrs,
 		},
 	)
 
@@ -206,7 +191,6 @@ func runNode(ctx context.Context, opts options) error {
 	cancel()
 	_ = peerServer.Close()
 	peerErr := <-peerErrCh
-	_ = follower.Close()
 	if serveErr != nil {
 		return fmt.Errorf("follower server: %w", serveErr)
 	}
