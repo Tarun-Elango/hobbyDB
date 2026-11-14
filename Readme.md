@@ -1,4 +1,4 @@
-# Key-value store
+# hobbyDB
 
 Distributed key-value store with Raft consensus, durable WAL, and a custom binary TCP protocol for clients and peer replication.
 
