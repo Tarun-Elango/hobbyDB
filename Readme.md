@@ -14,6 +14,8 @@ Run all server commands from the repo root (or `cd` into the paths shown). Use *
 
 Raft elects the leader automatically. Pass every node's client address in `-client-peers` so a follower can hand the client that leader's address. The client follows that address, and if the leader dies it asks the remaining nodes and switches to the next leader.
 
+Server logging is off by default; the commands below pass `-verbose` to turn it on (drop it for a quiet node).
+
 Optional profiling: add `-pprof-addr=127.0.0.1:8080` (use a different port per process).
 
 ## Run node A
@@ -22,6 +24,7 @@ Optional profiling: add `-pprof-addr=127.0.0.1:8080` (use a different port per p
 cd cmd/server
 go run . \
   -node-id=node-a \
+  -verbose \
   -client-addr=:9000 \
   -replication-addr=:9001 \
   -wal=data/node-a.wal \
@@ -35,6 +38,7 @@ go run . \
 cd cmd/server
 go run . \
   -node-id=node-b \
+  -verbose \
   -client-addr=:9010 \
   -replication-addr=:9002 \
   -wal=data/node-b.wal \
@@ -48,6 +52,7 @@ go run . \
 cd cmd/server
 go run . \
   -node-id=node-c \
+  -verbose \
   -client-addr=:9020 \
   -replication-addr=:9003 \
   -wal=data/node-c.wal \

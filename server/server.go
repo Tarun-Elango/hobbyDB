@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kvStore/logx"
 	"kvStore/proto"
 	"kvStore/raft"
 	"kvStore/replication"
@@ -154,7 +155,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		s.connections[conn] = struct{}{} // a set, using map with empty value
 		s.handlers.Add(1)                // counter
 		s.mu.Unlock()
-		fmt.Printf("client connected: %s\n", conn.RemoteAddr())
+		logx.Printf("client connected: %s\n", conn.RemoteAddr())
 		go s.serveConn(ctx, conn) // new routine serve each client conn
 	}
 }
@@ -167,10 +168,10 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		delete(s.connections, conn) // delete from pa
 		s.mu.Unlock()
 		s.handlers.Done() //decrememnt counter by 1
-		fmt.Printf("Disconnected %s \n", conn.RemoteAddr())
+		logx.Printf("Disconnected %s \n", conn.RemoteAddr())
 	}()
 	if err := s.handleConn(ctx, conn); err != nil && ctx.Err() == nil {
-		fmt.Printf("connection %s error: %v\n", conn.RemoteAddr(), err)
+		logx.Printf("connection %s error: %v\n", conn.RemoteAddr(), err)
 	}
 }
 
@@ -396,7 +397,7 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 	// async replicate
 	if s.leaderReplicator != nil {
 		if err := s.leaderReplicator.Replicate(context.Background(), entry); err != nil {
-			fmt.Printf("replication enqueue error for index %d: %v\n", entry.Index, err)
+			logx.Printf("replication enqueue error for index %d: %v\n", entry.Index, err)
 		}
 	}
 

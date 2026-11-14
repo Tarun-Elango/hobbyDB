@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"kvStore/logx"
 	"sync"
 	"time"
 )
@@ -128,7 +129,7 @@ func NewLeader(
 		leader.wg.Add(1) // done when followerworker defer
 
 		// goroutine
-		fmt.Printf("	starting go routine for follower: %s\n", follower.Addr)
+		logx.Printf("	starting go routine for follower: %s\n", follower.Addr)
 		go leader.followerWorker(follower)
 	}
 
@@ -355,12 +356,14 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	}
 
 	rpcCtx, cancel := context.WithTimeout(l.ctx, rpcTimeout)
-	fmt.Printf("replicating to %s with prevIndex:%d \n", follower.Addr, req.PrevIndex)
+	if logx.Enabled() {
+		logx.Printf("replicating to %s with prevIndex:%d \n", follower.Addr, req.PrevIndex)
+	}
 	resp, err := follower.Client.Append(rpcCtx, req)
 	cancel()
 
 	if err != nil {
-		fmt.Printf("replication to %s failed: %v",
+		logx.Printf("replication to %s failed: %v",
 			follower.Addr,
 			err)
 		return false, fmt.Errorf(

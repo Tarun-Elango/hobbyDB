@@ -3,6 +3,7 @@ package replication
 import (
 	"bytes"
 	"fmt"
+	"kvStore/logx"
 	"kvStore/proto"
 	"kvStore/store"
 	"kvStore/wal"
@@ -52,7 +53,7 @@ func NewFollower(
 		entries:  make(map[uint64]Entry),
 	}
 
-	fmt.Printf("Creating follower and replaying log\n")
+	logx.Printf("Creating follower and replaying log\n")
 	err = log.Replay(func(rec wal.Record) error {
 		entry, err := recordToEntry(rec) // record to entry
 		if err != nil {
@@ -90,7 +91,9 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	fmt.Printf("applying append from leaderid: %s and previndex:%d\n", req.LeaderID, req.PrevIndex)
+	if logx.Enabled() {
+		logx.Printf("applying append from leaderid: %s and previndex:%d\n", req.LeaderID, req.PrevIndex)
+	}
 	fail := func(code AppendErrorCode, err error) AppendResponse {
 		return AppendResponse{
 			Success:   false,

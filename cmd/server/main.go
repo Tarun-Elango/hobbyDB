@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"kvStore/logx"
 	"kvStore/proto"
 	"kvStore/raft"
 	"kvStore/replication"
@@ -33,6 +34,7 @@ type options struct {
 	walPath         string
 	peers           string
 	clientPeers     string
+	verbose         bool
 }
 
 func main() {
@@ -54,6 +56,7 @@ func run() error {
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
 	flag.StringVar(&opts.peers, "peers", "", "comma separated id=host:port pairs")
 	flag.StringVar(&opts.clientPeers, "client-peers", "", "comma separated id=clientHost:port pairs, used to redirect clients to the leader")
+	flag.BoolVar(&opts.verbose, "verbose", false, "enable server logging output")
 	flag.Parse() // parse the cmd line arguments
 
 	if opts.nodeID == "" {
@@ -63,6 +66,7 @@ func run() error {
 	if opts.walPath == "" {
 		opts.walPath = "data/" + opts.nodeID + ".wal"
 	}
+	logx.SetEnabled(opts.verbose)
 	ctx, stop := signal.NotifyContext( // get root context, signal watches for os signals
 		context.Background(),
 		os.Interrupt,
@@ -90,12 +94,12 @@ func run() error {
 		}()
 		go func() {
 			if err := pprofServer.Serve(pprofListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "pprof server: %v\n", err)
+				logx.Errorf("pprof server: %v\n", err)
 			}
 		}()
 	}
 
-	fmt.Printf("INFO: starting this as a follower Node\n")
+	logx.Printf("INFO: starting this as a follower Node\n")
 	return runNode(ctx, opts)
 
 }
@@ -191,7 +195,7 @@ func runNode(ctx context.Context, opts options) error {
 		peerErrCh <- err // send error to the channel
 	}()
 
-	fmt.Printf(
+	logx.Printf(
 		"starting follower node=%s client=%s replication=%s term=%d\n",
 		opts.nodeID,
 		opts.clientAddr,
