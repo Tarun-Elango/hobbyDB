@@ -25,6 +25,9 @@ func Int(key string) int {
 	return n
 }
 
+// String returns the raw string value of key.
+func String(key string) string { return raw(key) }
+
 // Duration returns key interpreted as milliseconds.
 func Duration(key string) time.Duration {
 	return time.Duration(Int(key)) * time.Millisecond

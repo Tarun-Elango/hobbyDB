@@ -214,10 +214,10 @@ func (s *session) remember(addr string) {
 	s.members = append(s.members, addr)
 }
 
-// Do sends one command. Writes follow a NotLeader redirect to the leader's
+// Do sends one command. Any command answered NotLeader (every write, and reads
+// when server.read.from=leader) follows the redirect to the leader's
 // client address, and try the other known members if that leader is gone.
 func (s *session) Do(cmd proto.Command) (proto.Response, error) {
-	write := cmd.Op == proto.OpSet || cmd.Op == proto.OpDel
 	// Keep retrying for a while instead of a fixed number of attempts: after the
 	// leader dies, the survivors need an election timeout plus an election
 	// before any of them can name a new leader.
@@ -252,7 +252,7 @@ func (s *session) Do(cmd proto.Command) (proto.Response, error) {
 			s.closeConn()
 			continue
 		}
-		if !write || resp.Status != proto.StatusNotLeader {
+		if resp.Status != proto.StatusNotLeader {
 			return resp, nil
 		}
 

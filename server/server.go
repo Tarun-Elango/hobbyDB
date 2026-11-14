@@ -22,6 +22,16 @@ import (
 // How long a client write waits for Raft to copy it to a majority and apply it.
 var raftProposeTimeout = config.Duration("server.raft.propose.timeout.ms")
 
+// Where reads are served: "any" node or only the "leader".
+var readFrom = mustReadFrom(config.String("server.read.from"))
+
+func mustReadFrom(v string) string {
+	if v != "any" && v != "leader" {
+		panic(fmt.Sprintf("config: server.read.from must be \"any\" or \"leader\", got %q", v))
+	}
+	return v
+}
+
 // config from user input, to set the server state like role, addr
 type Config struct {
 	Role       replication.Role
@@ -244,6 +254,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Response, error) {
 	switch cmd.Op {
 	case proto.OpGet:
+		if resp, redirect := s.readRedirect(); redirect {
+			return resp, nil
+		}
 		val, ok := s.store.Get(string(cmd.Key))
 		if !ok {
 			return proto.Response{Status: proto.StatusNotFound}, nil
@@ -264,6 +277,9 @@ func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Respons
 		return proto.Response{Status: proto.StatusOk}, nil
 
 	case proto.OpLen:
+		if resp, redirect := s.readRedirect(); redirect {
+			return resp, nil
+		}
 		//	do operation (get len), and send response object back
 		return proto.Response{Status: proto.StatusOk, Value: []byte(strconv.Itoa(s.store.Len()))}, nil
 	default:
@@ -271,6 +287,26 @@ func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Respons
 		return proto.Response{Status: proto.StatusError}, nil
 
 	}
+}
+
+// readRedirect applies server.read.from=leader: a node that is not the leader
+// answers NotLeader (with the leader's address when known) instead of reading
+// its local store. It reports false when this node may serve the read.
+func (s *Server) readRedirect() (proto.Response, bool) {
+	if readFrom != "leader" {
+		return proto.Response{}, false
+	}
+	if s.raftNode != nil {
+		snap := s.raftNode.Snapshot()
+		if snap.Role == raft.Leader {
+			return proto.Response{}, false
+		}
+		return notLeaderResponse(s.leaderTarget(snap.LeaderID)), true
+	}
+	if s.role != replication.RoleLeader {
+		return notLeaderResponse(s.leaderAddr), true
+	}
+	return proto.Response{}, false
 }
 
 // proposeRaftWrite appends the command on the leader and replies only after

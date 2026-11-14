@@ -309,3 +309,46 @@ func TestRaftLeaderWriteRepliesAfterApply(t *testing.T) {
 		t.Fatal("key still present after DEL")
 	}
 }
+
+func TestReadFromLeaderRedirectsFollowerReads(t *testing.T) {
+	old := readFrom
+	defer func() { readFrom = old }()
+
+	node := raft.NewNode("b")
+	node.Role = raft.Follower
+	node.LeaderID = "a"
+	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{
+		RaftNode:    node,
+		ClientAddrs: map[string]string{"a": "127.0.0.1:9000"},
+	})
+
+	for _, op := range []byte{proto.OpGet, proto.OpLen} {
+		readFrom = "any"
+		resp, err := s.dispatch(context.Background(), proto.Command{Op: op, Key: []byte("k")})
+		if err != nil || resp.Status == proto.StatusNotLeader {
+			t.Fatalf("op %d with read from any = %#v, %v; want a local answer", op, resp, err)
+		}
+
+		readFrom = "leader"
+		resp, err = s.dispatch(context.Background(), proto.Command{Op: op, Key: []byte("k")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != proto.StatusNotLeader || string(resp.Value) != "127.0.0.1:9000" {
+			t.Fatalf("op %d with read from leader = %#v, want NotLeader 127.0.0.1:9000", op, resp)
+		}
+	}
+
+	// PING never redirects.
+	resp, _ := s.dispatch(context.Background(), proto.Command{Op: proto.OpPing})
+	if resp.Status != proto.StatusOk {
+		t.Fatalf("ping = %#v, want OK", resp)
+	}
+
+	// The leader serves reads itself.
+	node.Role = raft.Leader
+	resp, _ = s.dispatch(context.Background(), proto.Command{Op: proto.OpGet, Key: []byte("k")})
+	if resp.Status == proto.StatusNotLeader {
+		t.Fatalf("leader redirected a read: %#v", resp)
+	}
+}
