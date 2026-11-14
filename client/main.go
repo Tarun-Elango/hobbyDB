@@ -12,7 +12,11 @@ import (
 )
 
 // How long to wait between passes when every known node is down or electing.
-const redirectPause = 100 * time.Millisecond
+const (
+	redirectPause = 100 * time.Millisecond
+	retryWindow   = 5 * time.Second
+	dialTimeout   = time.Second
+)
 
 /*
 - conn := dial tcp localhost 9000
@@ -188,7 +192,7 @@ func (s *session) closeConn() {
 
 func (s *session) connect(addr string) error {
 	s.closeConn()
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return err
 	}
@@ -213,14 +217,14 @@ func (s *session) remember(addr string) {
 // client address, and try the other known members if that leader is gone.
 func (s *session) Do(cmd proto.Command) (proto.Response, error) {
 	write := cmd.Op == proto.OpSet || cmd.Op == proto.OpDel
-	attempts := len(s.members) * 4
-	if attempts < 8 {
-		attempts = 8
-	}
+	// Keep retrying for a while instead of a fixed number of attempts: after the
+	// leader dies, the survivors need an election timeout plus an election
+	// before any of them can name a new leader.
+	deadline := time.Now().Add(retryWindow)
 
 	var lastErr error
 	failed := map[string]bool{}
-	for attempt := 0; attempt < attempts; attempt++ {
+	for time.Now().Before(deadline) {
 		if s.conn == nil {
 			addr, ok := s.nextAddr(failed)
 			if !ok {
@@ -267,9 +271,9 @@ func (s *session) Do(cmd proto.Command) (proto.Response, error) {
 			failed[s.current] = true
 		}
 		s.closeConn()
-		if hint == "" {
-			time.Sleep(redirectPause)
-		}
+		// No usable leader yet: either the node does not know one, or it still
+		// points at a leader we already found dead. Give the election time.
+		time.Sleep(redirectPause)
 	}
 	if lastErr != nil {
 		return proto.Response{}, lastErr
