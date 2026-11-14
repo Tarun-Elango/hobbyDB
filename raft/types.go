@@ -2,6 +2,7 @@ package raft
 
 import (
 	"kvStore/proto"
+	"kvStore/wal"
 	"sync"
 )
 
@@ -25,7 +26,8 @@ type Node struct {
 
 	// ---- identity ----
 	ID        string
-	statePath string // file path for saving state to disk
+	statePath string   // file path for saving state to disk
+	logWAL    *wal.Log // durable copy of Log; nil means the log is memory-only
 
 	// ---- all roles ----
 	Role        Role

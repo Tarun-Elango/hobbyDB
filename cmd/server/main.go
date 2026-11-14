@@ -128,6 +128,13 @@ func runNode(ctx context.Context, opts options) error {
 		_ = follower.Close()
 		return fmt.Errorf("open raft node: %w", err)
 	}
+	// load the durable raft log; committed entries are re-applied to the store
+	// by RunApply once a leader (or its no-op) commits them
+	if err := raftNode.OpenLog(opts.walPath + "-raft.log"); err != nil {
+		_ = follower.Close()
+		return err
+	}
+	defer raftNode.CloseLog()
 	// listen for peers, this is the "wait for messages" part
 	peerServer, err := replication.NewReplicationServer(
 		runCtx,

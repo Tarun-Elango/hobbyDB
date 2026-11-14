@@ -94,6 +94,9 @@ func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error)
 			Value: append([]byte(nil), cmd.Value...),
 		},
 	}
+	if err := n.persistAppendLocked(entry); err != nil { // durable before anyone can count it
+		return LogEntry{}, err
+	}
 	n.Log = append(n.Log, entry) // add new entry to log
 	n.advanceCommitLocked()
 
@@ -375,6 +378,9 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 	for _, entry := range args.Entries {
 		haveTerm, exists := n.logTermAtLocked(entry.Index)
 		if exists && haveTerm != entry.Term {
+			if err := n.persistTruncateLocked(entry.Index); err != nil {
+				return AppendEntriesResult{}, err
+			}
 			n.Log = n.Log[:entry.Index-1]
 			exists = false
 		}
@@ -383,6 +389,9 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 		}
 		if entry.Index != uint64(len(n.Log))+1 {
 			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
+		}
+		if err := n.persistAppendLocked(entry); err != nil {
+			return AppendEntriesResult{}, err
 		}
 		n.Log = append(n.Log, cloneLogEntry(entry))
 	}

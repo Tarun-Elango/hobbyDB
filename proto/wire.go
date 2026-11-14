@@ -9,6 +9,9 @@ const (
 	OpDel  byte = 3
 	OpPing byte = 4
 	OpLen  byte = 5
+	// OpNoop is internal to Raft: a new leader appends one so it can commit
+	// entries from earlier terms. Clients cannot send it.
+	OpNoop byte = 6
 )
 
 // status codes for responses

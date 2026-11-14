@@ -2,7 +2,10 @@ package raft
 
 import (
 	"context"
+	"fmt"
+	"kvStore/proto"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"time"
 )
@@ -240,6 +243,16 @@ func (n *Node) becomeLeader(term uint64) {
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIndex + 1
 		n.matchIndex[peer] = 0 // 0 cause we haven't replicated anything to this peer yet
+	}
+
+	// A leader only commits entries from its own term. Append a no-op so that
+	// entries from earlier terms (for example after a restart) commit with it.
+	noop := LogEntry{Index: lastIndex + 1, Term: term, Command: proto.Command{Op: proto.OpNoop}}
+	if err := n.persistAppendLocked(noop); err != nil {
+		fmt.Fprintf(os.Stderr, "raft: persist leader no-op: %v\n", err)
+	} else {
+		n.Log = append(n.Log, noop)
+		n.advanceCommitLocked() // single-node cluster commits immediately
 	}
 
 	for _, ch := range n.peerWake {

@@ -14,6 +14,8 @@ type Op byte
 const (
 	OpSet Op = 1
 	OpDel Op = 2
+	// OpNoop is a Raft leader's marker entry; it changes no key.
+	OpNoop Op = 3
 )
 
 type Record struct {
@@ -50,7 +52,7 @@ func EncodeRecord(w io.Writer, rec Record) error {
 	if rec.Index == 0 {
 		return ErrInvalidIndex
 	}
-	if rec.Op != byte(OpSet) && rec.Op != byte(OpDel) {
+	if rec.Op != byte(OpSet) && rec.Op != byte(OpDel) && rec.Op != byte(OpNoop) {
 		return ErrUnknownOp
 	}
 	if len(rec.Key) > MaxKeyLen {
@@ -160,7 +162,7 @@ func decodePayload(payload []byte) (Record, error) {
 		return Record{}, ErrIncompleteRecord
 	}
 	op := Op(opByte)
-	if op != OpSet && op != OpDel {
+	if op != OpSet && op != OpDel && op != OpNoop {
 		return Record{}, ErrUnknownOp
 	}
 	keyLen, err := readUint32(r)
