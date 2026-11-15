@@ -56,16 +56,3 @@ func (s *Store[K, V]) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.data)
 }
-
-// Calls fn for each key/value pair.
-// Stops iteration if fn returns false.
-func (s *Store[K, V]) Range(fn func(K, V) bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for k, v := range s.data {
-		if !fn(k, v) {
-			break
-		}
-	}
-}

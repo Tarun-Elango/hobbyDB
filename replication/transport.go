@@ -19,11 +19,6 @@ var (
 	rpcAttempts       = config.Int("replication.rpc.attempts")
 )
 
-type PeerClient interface {
-	Append(ctx context.Context, req AppendRequest) (AppendResponse, error)
-	Close() error
-}
-
 type TCPPeerClient struct {
 	addr string
 
@@ -104,104 +99,6 @@ func (c *TCPPeerClient) roundTrip(
 		return fmt.Errorf("replication: read from %s: %w", c.addr, err)
 	}
 	return ctx.Err()
-}
-
-// sends replication request from leader to follower
-// lock client
-// check if client closed expired
-// lazy connect c.conn == nil
-// register context cancellation -AfterFunc
-// apply context deadline
-// encode and send appendrequest
-// decode appendresponse
-// if fails call invalidateLocked
-// send resp to leader
-func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendResponse, error) {
-	if c == nil {
-		return AppendResponse{}, errors.New("replication: nil TCP peer client")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return AppendResponse{}, errors.New("replication: peer client is closed")
-	}
-	if err := ctx.Err(); err != nil {
-		return AppendResponse{}, err
-	}
-
-	if c.conn == nil {
-		dialer := net.Dialer{}
-
-		// c is follower, this func called by leader
-		conn, err := dialer.DialContext(ctx, "tcp", c.addr)
-		if err != nil {
-			if ctx.Err() != nil {
-				return AppendResponse{}, ctx.Err()
-			}
-			return AppendResponse{}, fmt.Errorf(
-				"replication: dial follower %s: %w",
-				c.addr,
-				err,
-			)
-		}
-		c.conn = conn
-	}
-
-	conn := c.conn
-
-	stopCancelWatcher := context.AfterFunc(ctx, func() {
-		_ = conn.Close()
-	})
-	defer stopCancelWatcher()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			c.invalidateLocked(conn)
-			return AppendResponse{}, err
-		}
-	}
-
-	defer conn.SetDeadline(time.Time{})
-
-	if err := EncodeAppendRequest(conn, req); err != nil { // req to json, then writes to tcp conn
-		c.invalidateLocked(conn)
-
-		if ctx.Err() != nil {
-			return AppendResponse{}, ctx.Err()
-		}
-		return AppendResponse{}, fmt.Errorf(
-			"replication: write append request to %s: %w",
-			c.addr,
-			err,
-		)
-	}
-
-	resp, err := DecodeAppendResponse(conn)
-
-	if err != nil {
-		c.invalidateLocked(conn)
-
-		if ctx.Err() != nil {
-			return AppendResponse{}, ctx.Err()
-		}
-		return AppendResponse{}, fmt.Errorf(
-			"replication: read append response from %s: %w",
-			c.addr,
-			err,
-		)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return AppendResponse{}, err
-	}
-
-	return resp, nil
-
 }
 
 // makes current connection unusable
@@ -539,8 +436,6 @@ func serveReplicationConnection(
 			return
 		}
 		switch frame.messageType {
-		case messageAppendRequest:
-			return
 		case messageRequestVote:
 			if raftNode == nil {
 				return

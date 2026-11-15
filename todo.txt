@@ -43,10 +43,10 @@ Change the client write path:
 4. The node applies the committed write and replies success.
 5. If the node isn’t leader, it tells the client who the leader is, if known.
 
--- current
 Stage 10: Check the cluster’s behavior
 Check that elections work, writes wait for a majority, failed nodes can rejoin, and restarted nodes recover their saved data.
 
+-- current
 
 Benchmark:
 - write throughput
@@ -57,15 +57,30 @@ Benchmark:
 - leader failure recovery ( stop leader, restart, see how long it takes to recover)
 - mixed read/write workload
 
+wal settings: 
+always write to disk (fsync before OK, with group commit) 
+interval (write, reply, fsync in the background), worst case : up to that interval lost on power loss
+never, worst case: whatever the OS hadn’t flushed
+
+WAL optimization: Batch writes to disk (group commit)
+Queue concurrent writes through a single ordered writer. Collect a batch up to a configurable byte/count limit or short time limit, append its WAL records together, and call file.Sync() once per batch instead of once per command. Preserve index ordering and apply writes only after the batch sync succeeds; reply success only after the required durability and replication conditions are met. Restructure the current writeMu path so requests can join a batch while earlier requests wait for durability. Bound the queue for backpressure, propagate append/sync failures to affected requests, and drain pending writes on graceful shutdown. Measure throughput and latency to choose batch limits.
+
+allow all followers to be always upto date with the leader. quorum = all nodes.
+
 Store optimization: Shard the map
 Split the store into, for example, 32 shards, each with its own map and RWMutex; hash(key) & 31 selects the shard. Even read locks increment and decrement a shared atomic reader counter, so concurrent GETs on different CPU cores compete for the same cache line today. Sharding spreads that traffic and reduces interference between reads and writes. Measure whether adjacent shard locks need padding to avoid false sharing. Account for the extra key hashing and hot keys, and coordinate all shards to preserve Replace's atomic semantics. The server already serializes writes with writeMu, so the main expected benefit is concurrent GET throughput. Before comparing results, precompute benchmark keys and use a local counter per goroutine instead of fmt.Sprintf and a shared atomic counter in every iteration.
 
 Store optimization: Store bytes in chunks and index them with integer offsets
 If millions of entries make heap size and GC CPU significant, consider replacing map[string][]byte with a map[uint64]Entry containing only integer offsets, lengths, and collision metadata, backed by a few large byte chunks. Hash each key, find candidate entries, and compare stored key bytes to resolve collisions correctly. Pointer-free map entries let Go skip scanning their storage, while chunks can reduce per-entry allocations and metadata overhead. This requires reclaiming deleted or overwritten data, compaction, collision handling, and keeping returned []byte values valid. Pursue this redesign only when measurements justify its complexity; try sharding first.
 
-WAL optimization: Batch writes to disk (group commit)
-Queue concurrent writes through a single ordered writer. Collect a batch up to a configurable byte/count limit or short time limit, append its WAL records together, and call file.Sync() once per batch instead of once per command. Preserve index ordering and apply writes only after the batch sync succeeds; reply success only after the required durability and replication conditions are met. Restructure the current writeMu path so requests can join a batch while earlier requests wait for durability. Bound the queue for backpressure, propagate append/sync failures to affected requests, and drain pending writes on graceful shutdown. Measure throughput and latency to choose batch limits.
-
 Replication and WAL: Add snapshots and log compaction
 Periodically persist a consistent snapshot of the key-value state at an applied, committed log index, including its term and the metadata needed for recovery. Make the snapshot durable and publish it atomically before removing the covered WAL records or in-memory replication entries. Retain the suffix after the snapshot and recover by loading the snapshot, then replaying that suffix. Replace assumptions that log indices start at 1 or equal slice positions with a snapshot/base index. Release references to compacted entries so their copied keys and values can be garbage-collected, and reclaim unused backing storage. Add snapshot installation for followers that fall behind the retained log; they must be able to recover even after the leader has discarded their missing history. Trigger compaction using retained log bytes or entry count, and cover crash recovery, concurrent writes during snapshots, and follower catchup across the compaction boundary. This bounds retained history between compactions; the live dataset must still fit in memory.
+
+gossip protocol:
+allow to add/remove nodes to the cluster dynamically, and also dynamically manage the current cluster membership.
+
+health check:
+simple health check endpoint that returns 200 if the node is healthy, 500 if it is not.
+
+expand to on disk structure, option available to enable/disable.
 

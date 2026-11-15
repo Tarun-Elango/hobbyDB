@@ -38,8 +38,7 @@ type Config struct {
 	LeaderAddr string
 	NextIndex  uint64
 
-	LeaderReplicator *replication.Leader
-	RaftNode         *raft.Node
+	RaftNode *raft.Node
 	// ClientAddrs maps a Raft node id to the address clients dial.
 	// A follower uses it to redirect writes to the current leader.
 	ClientAddrs map[string]string
@@ -55,8 +54,6 @@ type Server struct {
 	role       replication.Role
 	leaderAddr string
 	nextIndex  uint64
-
-	leaderReplicator *replication.Leader
 
 	writeMu  sync.Mutex //serialize index allocation
 	writeErr error      // first WAL append/sync failure; protected by writeMu
@@ -94,15 +91,14 @@ func NewWithConfig(
 	}
 
 	return &Server{
-		store:            st,
-		log:              log,
-		role:             cfg.Role,
-		leaderAddr:       cfg.LeaderAddr,
-		nextIndex:        cfg.NextIndex,
-		leaderReplicator: cfg.LeaderReplicator,
-		connections:      make(map[net.Conn]struct{}),
-		raftNode:         cfg.RaftNode,
-		clientAddrs:      copyClientAddrs(cfg.ClientAddrs),
+		store:       st,
+		log:         log,
+		role:        cfg.Role,
+		leaderAddr:  cfg.LeaderAddr,
+		nextIndex:   cfg.NextIndex,
+		connections: make(map[net.Conn]struct{}),
+		raftNode:    cfg.RaftNode,
+		clientAddrs: copyClientAddrs(cfg.ClientAddrs),
 	}
 }
 
@@ -203,10 +199,6 @@ func (s *Server) shutdown() {
 			_ = conn.SetDeadline(deadline) // immediately stop any live conn, by forcing timeout error
 		}
 		s.handlers.Wait() // wait till all goroutine have decreemented till 0
-
-		if s.leaderReplicator != nil {
-			s.leaderReplicator.Close()
-		}
 
 		s.logCloseOnce.Do(func() {
 			if s.log != nil {
@@ -423,13 +415,6 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 	}
 
 	s.nextIndex++
-
-	// async replicate
-	if s.leaderReplicator != nil {
-		if err := s.leaderReplicator.Replicate(context.Background(), entry); err != nil {
-			logx.Printf("replication enqueue error for index %d: %v\n", entry.Index, err)
-		}
-	}
 
 	return proto.Response{Status: proto.StatusOk}, nil
 }

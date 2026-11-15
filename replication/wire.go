@@ -26,7 +26,3 @@ u8 protocol version
 u8 message type
 message payload
 */
-
-// appendrequest struct in types.go
-
-// append response struct in types.go
