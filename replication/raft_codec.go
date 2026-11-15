@@ -307,7 +307,13 @@ func encodeRaftLogEntry(w io.Writer, entry raft.LogEntry) error {
 	if err := writeU32(w, uint32(len(entry.Command.Value))); err != nil {
 		return err
 	}
-	return writeFull(w, entry.Command.Value)
+	if err := writeFull(w, entry.Command.Value); err != nil {
+		return err
+	}
+	if err := writeU64(w, entry.Command.ClientID); err != nil {
+		return err
+	}
+	return writeU64(w, entry.Command.Seq)
 }
 
 func decodeRaftLogEntry(r io.Reader) (raft.LogEntry, error) {
@@ -345,13 +351,23 @@ func decodeRaftLogEntry(r io.Reader) (raft.LogEntry, error) {
 	if err != nil {
 		return raft.LogEntry{}, err
 	}
+	clientID, err := readU64(r)
+	if err != nil {
+		return raft.LogEntry{}, err
+	}
+	seq, err := readU64(r)
+	if err != nil {
+		return raft.LogEntry{}, err
+	}
 	return raft.LogEntry{
 		Index: index,
 		Term:  term,
 		Command: proto.Command{
-			Op:    op,
-			Key:   key,
-			Value: value,
+			Op:       op,
+			Key:      key,
+			Value:    value,
+			ClientID: clientID,
+			Seq:      seq,
 		},
 	}, nil
 }

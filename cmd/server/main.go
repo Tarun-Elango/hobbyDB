@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"kvStore/logx"
-	"kvStore/proto"
 	"kvStore/raft"
 	"kvStore/replication"
 	"kvStore/server"
@@ -109,7 +108,7 @@ func run() error {
 // - runCtx: cancellable context to stop raft, replication, and client together
 // - NewReplicationServer: bind replication TCP (does not accept until Serve)
 // - OpenNode + SetPeers + go Run: load Raft state, register peers, start elections
-// - NewWithConfig: wire client TCP server with Raft
+// - server.New: wire client TCP server with Raft
 // - go RunApply: apply committed raft entries to the store, in order
 // - go peerServer.Serve: accept peer Raft RPCs (votes, append, heartbeat)
 // - srv.Serve: block serving client requests until shutdown
@@ -154,22 +153,15 @@ func runNode(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
-	go raftNode.Run(runCtx, peerSet.RequestVote)              // run the election timer in its own goroutine
-	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)      // run the heartbeat timer in its own goroutine
-	go raftNode.RunReplication(runCtx, peerSet.AppendEntries) // copy the leader log to peers
-	go raftNode.RunApply(runCtx, func(cmd proto.Command) {    // apply committed raft log entries, one at a time
-		applyRaftCommand(st, cmd)
-	})
+	go raftNode.Run(runCtx, peerSet.RequestVote)                   // run the election timer in its own goroutine
+	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)           // run the heartbeat timer in its own goroutine
+	go raftNode.RunReplication(runCtx, peerSet.AppendEntries)      // copy the leader log to peers
+	go raftNode.RunApply(runCtx, server.NewStateMachine(st).Apply) // apply committed entries in order, each client write once
 
-	srv := server.NewWithConfig(
-		st,
-		nil,
-		&server.Config{
-			Role:        replication.RoleFollower,
-			RaftNode:    raftNode,
-			ClientAddrs: clientAddrs,
-		},
-	)
+	srv := server.New(st, server.Config{
+		RaftNode:    raftNode,
+		ClientAddrs: clientAddrs,
+	})
 
 	peerErrCh := make(chan error, 1) // error channel for the peer server
 	go func() {
@@ -199,16 +191,6 @@ func runNode(ctx context.Context, opts options) error {
 	}
 	return nil
 
-}
-
-// applyRaftCommand writes one committed raft command into the in-memory store.
-func applyRaftCommand(st *store.Store[string, []byte], cmd proto.Command) {
-	switch cmd.Op {
-	case proto.OpSet:
-		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
-	case proto.OpDel:
-		st.Delete(string(cmd.Key))
-	}
 }
 
 // clientAddrMap records where clients can dial each node.

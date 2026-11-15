@@ -12,8 +12,14 @@ import (
 )
 
 // Identifies the WAL format and version so incompatible or legacy files can be rejected safely.
-// bytes added to top of file as a indicator
-var walHeader = []byte{'K', 'V', 'W', 'L', 2} // 2 -> version
+// bytes added to top of file as a indicator.
+// v3 records may end with [clientID][seq]; v2 records never do. A v2 file is
+// read as-is and new records are appended to it in the v3 layout, which a
+// v3 reader accepts either way.
+var walHeader = []byte{'K', 'V', 'W', 'L', 3} // 3 -> version
+
+// older headers this version still reads
+var walHeaderV2 = []byte{'K', 'V', 'W', 'L', 2}
 
 var ErrUnsupportedFormat = errors.New(
 	"wal: unsupported format; migrate or delete the existing WAL",
@@ -47,8 +53,8 @@ func ensureHeader(file *os.File) error {
 
 	got := make([]byte, len(walHeader))
 	n, err := file.ReadAt(got, 0) // read at offset 0 -> got list
-	if err != nil || n != len(walHeader) || !bytes.Equal(got, walHeader) {
-		return fmt.Errorf("%w: expected WAL v1 header", ErrUnsupportedFormat)
+	if err != nil || n != len(walHeader) || (!bytes.Equal(got, walHeader) && !bytes.Equal(got, walHeaderV2)) {
+		return fmt.Errorf("%w: expected WAL v2 or v3 header", ErrUnsupportedFormat)
 	}
 	return nil
 }

@@ -56,3 +56,48 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 		n.mu.Unlock()
 	}
 }
+
+// WaitLeaderRead blocks until this leader's store is safe to read: an entry
+// from the current term is committed (so CommitIndex covers every write any
+// earlier leader acknowledged), and the store has applied up to that point.
+// A freshly elected or restarted leader starts with an empty or partial store
+// until its no-op commits; reading before then can miss committed writes.
+// Returns ErrNotLeader if this node is not (or stops being) the leader.
+func (n *Node) WaitLeaderRead(ctx context.Context) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // ctx cancel has to wake the wait below
+		select {
+		case <-ctx.Done():
+			n.mu.Lock()
+			n.applyCond.Broadcast()
+			n.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	var (
+		readIndex uint64
+		ready     bool // readIndex is fixed once a current-term entry has committed
+	)
+	for {
+		if n.Role != Leader {
+			return ErrNotLeader
+		}
+		if !ready {
+			if term, ok := n.logTermAtLocked(n.CommitIndex); ok && term == n.CurrentTerm {
+				readIndex, ready = n.CommitIndex, true
+			}
+		}
+		if ready && n.LastApplied >= readIndex {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		n.applyCond.Wait()
+	}
+}

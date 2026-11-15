@@ -10,9 +10,7 @@ import (
 	"kvStore/logx"
 	"kvStore/proto"
 	"kvStore/raft"
-	"kvStore/replication"
 	"kvStore/store"
-	"kvStore/wal"
 	"net"
 	"strconv"
 	"sync"
@@ -32,31 +30,18 @@ func mustReadFrom(v string) string {
 	return v
 }
 
-// config from user input, to set the server state like role, addr
+// Config wires the client server to its Raft node.
 type Config struct {
-	Role       replication.Role
-	LeaderAddr string
-	NextIndex  uint64
-
-	RaftNode *raft.Node
+	RaftNode *raft.Node // required: leadership and writes go through Raft
 	// ClientAddrs maps a Raft node id to the address clients dial.
 	// A follower uses it to redirect writes to the current leader.
 	ClientAddrs map[string]string
 }
 
-// the actual running server object with the store
-// server will keep the store, contructor will create the struct,
-// prevents every function receiving the store
+// Server answers client requests for one cluster member. Reads come from the
+// store (filled by Raft's apply loop); writes are proposed to Raft.
 type Server struct {
 	store *store.Store[string, []byte]
-	log   *wal.Log // pointer to wal.log ( has file descriptor and mutex)
-
-	role       replication.Role
-	leaderAddr string
-	nextIndex  uint64
-
-	writeMu  sync.Mutex //serialize index allocation
-	writeErr error      // first WAL append/sync failure; protected by writeMu
 
 	listener    net.Listener          // lets shutdown() close it, cause shutdown can be called from different routine,
 	connections map[net.Conn]struct{} // clientConn1: {}, clientConn2: {}
@@ -65,37 +50,18 @@ type Server struct {
 	shuttingDown bool           // prevent accepting/starting while shutting down
 	handlers     sync.WaitGroup // lets shutdown() wait for all goroutines to finish
 	shutDownOnce sync.Once      // helps ensure shutdown only happens once, sync.once guarantees once execution - used in shutdown
-	logCloseOnce sync.Once
 
 	raftNode    *raft.Node
 	clientAddrs map[string]string
 }
 
-// constructor, takes store, returns server pointer
-func New(s *store.Store[string, []byte], log *wal.Log) *Server {
-	return &Server{
-		store:       s,
-		log:         log,
-		nextIndex:   1,
-		connections: make(map[net.Conn]struct{}), // make a set, we keep value as empty struct - no mem alloc
+// New builds a server over st. cfg.RaftNode must be set.
+func New(st *store.Store[string, []byte], cfg Config) *Server {
+	if cfg.RaftNode == nil {
+		panic("server: Config.RaftNode is required")
 	}
-}
-
-func NewWithConfig(
-	st *store.Store[string, []byte],
-	log *wal.Log,
-	cfg *Config,
-) *Server {
-	if cfg.NextIndex == 0 {
-		cfg.NextIndex = 1
-	}
-
 	return &Server{
 		store:       st,
-		log:         log,
-		role:        cfg.Role,
-		leaderAddr:  cfg.LeaderAddr,
-		nextIndex:   cfg.NextIndex,
 		connections: make(map[net.Conn]struct{}),
 		raftNode:    cfg.RaftNode,
 		clientAddrs: copyClientAddrs(cfg.ClientAddrs),
@@ -199,12 +165,6 @@ func (s *Server) shutdown() {
 			_ = conn.SetDeadline(deadline) // immediately stop any live conn, by forcing timeout error
 		}
 		s.handlers.Wait() // wait till all goroutine have decreemented till 0
-
-		s.logCloseOnce.Do(func() {
-			if s.log != nil {
-				_ = s.log.Close()
-			}
-		})
 	})
 }
 
@@ -246,7 +206,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Response, error) {
 	switch cmd.Op {
 	case proto.OpGet:
-		if resp, redirect := s.readRedirect(); redirect {
+		if resp, redirect := s.readRedirect(ctx); redirect {
 			return resp, nil
 		}
 		val, ok := s.store.Get(string(cmd.Key))
@@ -255,21 +215,14 @@ func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Respons
 		}
 		return proto.Response{Status: proto.StatusOk, Value: val}, nil
 	case proto.OpSet, proto.OpDel:
-		// Cluster nodes decide leadership from Raft, not from the startup role.
-		if s.raftNode != nil {
-			return s.proposeRaftWrite(ctx, cmd)
-		}
-		if s.role != replication.RoleLeader {
-			return notLeaderResponse(s.leaderAddr), nil
-		}
-
-		return s.applyLeaderWrite(cmd)
+		// leadership comes from Raft's current state
+		return s.proposeRaftWrite(ctx, cmd)
 
 	case proto.OpPing:
 		return proto.Response{Status: proto.StatusOk}, nil
 
 	case proto.OpLen:
-		if resp, redirect := s.readRedirect(); redirect {
+		if resp, redirect := s.readRedirect(ctx); redirect {
 			return resp, nil
 		}
 		//	do operation (get len), and send response object back
@@ -284,21 +237,31 @@ func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Respons
 // readRedirect applies server.read.from=leader: a node that is not the leader
 // answers NotLeader (with the leader's address when known) instead of reading
 // its local store. It reports false when this node may serve the read.
-func (s *Server) readRedirect() (proto.Response, bool) {
+//
+// On the leader it also waits until the store has caught up with every
+// committed write (see raft.WaitLeaderRead): a just-elected or restarted
+// leader rebuilds its store only after its no-op commits.
+func (s *Server) readRedirect(ctx context.Context) (proto.Response, bool) {
 	if readFrom != "leader" {
 		return proto.Response{}, false
 	}
-	if s.raftNode != nil {
-		snap := s.raftNode.Snapshot()
-		if snap.Role == raft.Leader {
-			return proto.Response{}, false
-		}
-		return notLeaderResponse(s.leaderTarget(snap.LeaderID)), true
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if s.role != replication.RoleLeader {
-		return notLeaderResponse(s.leaderAddr), true
+	readCtx, cancel := context.WithTimeout(ctx, raftProposeTimeout)
+	defer cancel()
+	err := s.raftNode.WaitLeaderRead(readCtx)
+	switch {
+	case err == nil:
+		return proto.Response{}, false
+	case errors.Is(err, raft.ErrNotLeader):
+		return notLeaderResponse(s.leaderTarget(s.raftNode.Snapshot().LeaderID)), true
+	default:
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte("timed out waiting for the leader to catch up"),
+		}, true
 	}
-	return proto.Response{}, false
 }
 
 // proposeRaftWrite appends the command on the leader and replies only after
@@ -349,94 +312,4 @@ func (s *Server) leaderTarget(leaderID string) string {
 		return addr
 	}
 	return leaderID
-}
-
-// write pipeline for a standalone server that is not part of a Raft cluster.
-func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	// we had error set before, so return
-	if s.writeErr != nil {
-		return proto.Response{
-			Status: proto.StatusError,
-			Value:  []byte("writes are disabled after a WAL error: " + s.writeErr.Error()),
-		}, nil
-	}
-
-	if s.log == nil {
-		return proto.Response{
-			Status: proto.StatusError,
-			Value:  []byte("server WAL is unavailable"),
-		}, nil
-	}
-
-	var term uint64
-	if s.raftNode != nil {
-		term = s.raftNode.Snapshot().CurrentTerm // current term from snapshot
-	}
-
-	entry := replication.Entry{
-		Index: s.nextIndex,
-		Term:  term,
-		Command: proto.Command{
-			Op:    cmd.Op,
-			Key:   append([]byte(nil), cmd.Key...),
-			Value: append([]byte(nil), cmd.Value...),
-		},
-	}
-
-	record, err := recordFromEntry(entry)
-	if err != nil {
-		return proto.Response{
-			Status: proto.StatusError,
-			Value:  []byte(err.Error()),
-		}, nil
-	}
-
-	//durable local write first.
-	if err := s.log.Append(record); err != nil {
-		// A failed append or sync may have left a partial record, or may have
-		// persisted the record despite returning an error. Do not append behind
-		// that uncertain state; require a restart and WAL replay first.
-		s.writeErr = err
-		return proto.Response{
-			Status: proto.StatusError,
-			Value:  []byte(err.Error()),
-		}, nil
-	}
-
-	// apply after wal good
-	switch cmd.Op {
-	case proto.OpSet:
-		s.store.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
-	case proto.OpDel:
-		s.store.Delete(string(cmd.Key))
-	}
-
-	s.nextIndex++
-
-	return proto.Response{Status: proto.StatusOk}, nil
-}
-
-func recordFromEntry(entry replication.Entry) (wal.Record, error) {
-	record := wal.Record{
-		Index: entry.Index,
-		Term:  entry.Term, // need to make it through both leader and followers wal conversion
-		Key:   append([]byte(nil), entry.Command.Key...),
-		Value: append([]byte(nil), entry.Command.Value...),
-	}
-	switch entry.Command.Op {
-	case proto.OpSet:
-		record.Op = byte(wal.OpSet)
-	case proto.OpDel:
-		record.Op = byte(wal.OpDel)
-	default:
-		return wal.Record{}, fmt.Errorf(
-			"unsupported replicated command op: %d",
-			entry.Command.Op,
-		)
-	}
-
-	return record, nil
 }

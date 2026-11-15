@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -584,5 +585,131 @@ func TestTruncateFromReplacesSuffix(t *testing.T) {
 	}
 	if got[0].Index != 1 || got[1].Index != 2 || string(got[1].Value) != "new" {
 		t.Fatalf("replayed records = %#v, want retained prefix plus replacement", got)
+	}
+}
+
+// A record whose bytes are all present and whose checksum matches, but whose
+// payload is too short for its fields, is corruption. Replay must fail and
+// must not truncate it (or the valid records after it) as if it were a torn tail.
+func TestReplayRejectsMalformedRecordMidFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	if err := log.Append(Record{Index: 1, Op: byte(OpSet), Key: []byte("a")}); err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// checksum-valid record with a 5-byte payload: too short for the index field.
+	var bad bytes.Buffer
+	payload := []byte{1, 2, 3, 4, 5}
+	_ = writeUint32(&bad, uint32(len(payload)))
+	bad.Write(payload)
+	_ = writeUint32(&bad, crc32.ChecksumIEEE(payload))
+	var good bytes.Buffer
+	if err := EncodeRecord(&good, Record{Index: 2, Op: byte(OpSet), Key: []byte("b")}); err != nil {
+		t.Fatalf("encode 2: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write(bad.Bytes())
+	f.Write(good.Bytes())
+	f.Close()
+	before, _ := os.ReadFile(path)
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer log.Close()
+	err = log.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrMalformedRecord) {
+		t.Fatalf("Replay() error = %v, want ErrMalformedRecord", err)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("WAL was modified: %d bytes before, %d after", len(before), len(after))
+	}
+}
+
+func TestRecordRoundTripWithClientID(t *testing.T) {
+	for _, rec := range []Record{
+		{Index: 1, Term: 2, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v"), ClientID: 5, Seq: 9},
+		{Index: 2, Term: 2, Op: byte(OpNoop)}, // no client: no trailer
+	} {
+		var buf bytes.Buffer
+		if err := EncodeRecord(&buf, rec); err != nil {
+			t.Fatal(err)
+		}
+		got, err := DecodeRecord(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ClientID != rec.ClientID || got.Seq != rec.Seq || got.Index != rec.Index {
+			t.Fatalf("got %+v, want %+v", got, rec)
+		}
+	}
+}
+
+func TestDecodeRecordRejectsBadTrailer(t *testing.T) {
+	var payload bytes.Buffer
+	_ = writeUint64(&payload, 1)
+	_ = writeUint64(&payload, 1)
+	payload.WriteByte(byte(OpSet))
+	_ = writeUint32(&payload, 0)
+	_ = writeUint32(&payload, 0)
+	payload.Write([]byte{1, 2, 3}) // 3 trailing bytes: neither 0 nor 16
+
+	var buf bytes.Buffer
+	_ = writeUint32(&buf, uint32(payload.Len()))
+	buf.Write(payload.Bytes())
+	_ = writeUint32(&buf, crc32.ChecksumIEEE(payload.Bytes()))
+	if _, err := DecodeRecord(&buf); !errors.Is(err, ErrMalformedRecord) {
+		t.Fatalf("err = %v, want ErrMalformedRecord", err)
+	}
+}
+
+// A v2 file (header version 2, records without the client trailer) still
+// opens, replays, and accepts new records that carry client ids.
+func TestOpenReadsV2AndAppends(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.wal")
+	var file bytes.Buffer
+	file.Write(walHeaderV2)
+	if err := EncodeRecord(&file, Record{Index: 1, Term: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, file.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open v2: %v", err)
+	}
+	if err := log.Replay(func(Record) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(Record{Index: 2, Term: 1, Op: byte(OpSet), Key: []byte("b"), ClientID: 3, Seq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var got []Record
+	if err := log.Replay(func(r Record) error { got = append(got, r); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ClientID != 0 || got[1].ClientID != 3 || got[1].Seq != 1 {
+		t.Fatalf("records = %+v", got)
 	}
 }

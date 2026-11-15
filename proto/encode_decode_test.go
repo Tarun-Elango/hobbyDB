@@ -18,18 +18,20 @@ func TestRoundTripCommand(t *testing.T) {
 		name string
 		cmd  Command
 	}{
-		{"get with normal key", Command{OpGet, []byte("hello"), nil}},
-		{"set with normal key+value", Command{OpSet, []byte("hello"), []byte("world")}},
-		{"delete", Command{OpDel, []byte("hello"), nil}},
-		{"ping, no key no value", Command{OpPing, nil, nil}},
-		{"empty key", Command{OpSet, []byte(""), []byte("value")}},
-		{"empty value on set", Command{OpSet, []byte("key"), []byte("")}},
-		{"empty key and empty value", Command{OpSet, []byte(""), []byte("")}},
-		{"max length key", Command{OpSet, []byte(strings.Repeat("k", MaxKeyLen)), []byte("v")}},
-		{"single byte value", Command{OpSet, []byte("k"), []byte("x")}},
-		{"large value 1MB", Command{OpSet, []byte("k"), largeValue}},
-		{"binary non-utf8 key bytes", Command{OpSet, []byte{0x00, 0xFF, 0x01}, []byte("v")}},
-		{"binary value with embedded null bytes", Command{OpSet, []byte("k"), []byte{0x41, 0x00, 0x42, 0x00, 0x43}}},
+		{"get with normal key", Command{Op: OpGet, Key: []byte("hello"), Value: nil}},
+		{"set with normal key+value", Command{Op: OpSet, Key: []byte("hello"), Value: []byte("world")}},
+		{"delete", Command{Op: OpDel, Key: []byte("hello"), Value: nil}},
+		{"set with client id and seq", Command{Op: OpSet, Key: []byte("k"), Value: []byte("v"), ClientID: 0xdeadbeef, Seq: 42}},
+		{"delete with client id and seq", Command{Op: OpDel, Key: []byte("k"), ClientID: 7, Seq: 1}},
+		{"ping, no key no value", Command{Op: OpPing, Key: nil, Value: nil}},
+		{"empty key", Command{Op: OpSet, Key: []byte(""), Value: []byte("value")}},
+		{"empty value on set", Command{Op: OpSet, Key: []byte("key"), Value: []byte("")}},
+		{"empty key and empty value", Command{Op: OpSet, Key: []byte(""), Value: []byte("")}},
+		{"max length key", Command{Op: OpSet, Key: []byte(strings.Repeat("k", MaxKeyLen)), Value: []byte("v")}},
+		{"single byte value", Command{Op: OpSet, Key: []byte("k"), Value: []byte("x")}},
+		{"large value 1MB", Command{Op: OpSet, Key: []byte("k"), Value: largeValue}},
+		{"binary non-utf8 key bytes", Command{Op: OpSet, Key: []byte{0x00, 0xFF, 0x01}, Value: []byte("v")}},
+		{"binary value with embedded null bytes", Command{Op: OpSet, Key: []byte("k"), Value: []byte{0x41, 0x00, 0x42, 0x00, 0x43}}},
 	}
 
 	for _, tc := range tests {
@@ -53,6 +55,9 @@ func TestRoundTripCommand(t *testing.T) {
 			}
 			if !bytes.Equal(got.Value, tc.cmd.Value) {
 				t.Errorf("Value = %v, want %v", got.Value, tc.cmd.Value)
+			}
+			if got.ClientID != tc.cmd.ClientID || got.Seq != tc.cmd.Seq {
+				t.Errorf("ClientID, Seq = %d, %d, want %d, %d", got.ClientID, got.Seq, tc.cmd.ClientID, tc.cmd.Seq)
 			}
 
 			// at this point empty buffer

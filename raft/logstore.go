@@ -1,15 +1,23 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 
 	"kvStore/proto"
 	"kvStore/wal"
 )
 
+// ErrLogAheadOfState means the raft log holds an entry from a term later than
+// the term in the state file. The state file was deleted, or restored from an
+// older copy, so votes this node already cast are forgotten. Booting would let
+// it vote twice in one term (two leaders in that term), so startup stops.
+var ErrLogAheadOfState = errors.New("raft log is ahead of the persisted term")
+
 // OpenLog opens the durable raft log at path and loads every entry into memory.
 // Entries are not applied to the store here: whether they are committed is
 // only known once a leader says so.
+// Call it after OpenNode: it checks the log against the persisted term.
 func (n *Node) OpenLog(path string) error {
 	log, err := wal.Open(path)
 	if err != nil {
@@ -24,7 +32,7 @@ func (n *Node) OpenLog(path string) error {
 		entries = append(entries, LogEntry{
 			Index:   rec.Index,
 			Term:    rec.Term,
-			Command: proto.Command{Op: op, Key: rec.Key, Value: rec.Value},
+			Command: proto.Command{Op: op, Key: rec.Key, Value: rec.Value, ClientID: rec.ClientID, Seq: rec.Seq},
 		})
 		return nil
 	})
@@ -34,9 +42,20 @@ func (n *Node) OpenLog(path string) error {
 	}
 
 	n.mu.Lock()
+	defer n.mu.Unlock()
+	// Terms only grow and every entry's term was the leader's current term,
+	// so a durable state file is always at or above the last entry's term.
+	if len(entries) > 0 {
+		if last := entries[len(entries)-1]; last.Term > n.CurrentTerm {
+			_ = log.Close()
+			return fmt.Errorf(
+				"%w: log %s ends at index %d term %d, state file %s has term %d; "+
+					"remove both files to rejoin as an empty node",
+				ErrLogAheadOfState, path, last.Index, last.Term, n.statePath, n.CurrentTerm)
+		}
+	}
 	n.logWAL = log
 	n.Log = entries
-	n.mu.Unlock()
 	return nil
 }
 
@@ -63,11 +82,13 @@ func (n *Node) persistAppendLocked(entry LogEntry) error {
 		return err
 	}
 	return n.logWAL.Append(wal.Record{
-		Index: entry.Index,
-		Term:  entry.Term,
-		Op:    op,
-		Key:   entry.Command.Key,
-		Value: entry.Command.Value,
+		Index:    entry.Index,
+		Term:     entry.Term,
+		Op:       op,
+		Key:      entry.Command.Key,
+		Value:    entry.Command.Value,
+		ClientID: entry.Command.ClientID,
+		Seq:      entry.Command.Seq,
 	})
 }
 

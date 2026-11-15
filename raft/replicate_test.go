@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -369,4 +370,133 @@ func TestFollowerLearnsCommitWithoutNewWrite(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("follower commit index = %d, want 1", follower.Snapshot().CommitIndex)
+}
+
+// A follower that restarts (CommitIndex back to 0) or loses its log after the
+// leader already told it the commit index must catch up without a new write.
+func TestRestartedFollowerCatchesUpWhileIdle(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		keepLog bool
+	}{
+		{name: "log kept, commit reset", keepLog: true},
+		{name: "log wiped", keepLog: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leader := NewNode("a")
+			if err := leader.SetPeers([]string{"b"}); err != nil {
+				t.Fatal(err)
+			}
+			leader.CurrentTerm = 1
+			leader.Role = Leader
+			leader.nextIndex = map[string]uint64{"b": 1}
+			leader.matchIndex = map[string]uint64{"b": 0}
+
+			var mu sync.Mutex
+			follower := NewNode("b")
+			follower.CurrentTerm = 1
+			current := func() *Node { mu.Lock(); defer mu.Unlock(); return follower }
+			rpc := func(ctx context.Context, peer string, args AppendEntriesArgs) (AppendEntriesResult, error) {
+				return current().HandleAppendEntries(args)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go leader.RunReplication(ctx, rpc)
+			go leader.RunApply(ctx, func(proto.Command) {})
+
+			pctx, pcancel := context.WithTimeout(ctx, 2*time.Second)
+			defer pcancel()
+			if _, err := leader.Propose(pctx, proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")}); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, func() bool { return current().Snapshot().CommitIndex == 1 })
+
+			// restart the follower: same term, commit index lost, log maybe lost too
+			restarted := NewNode("b")
+			restarted.CurrentTerm = 1
+			if tc.keepLog {
+				restarted.Log = current().Snapshot().Log
+			}
+			mu.Lock()
+			follower = restarted
+			mu.Unlock()
+
+			waitFor(t, func() bool {
+				s := restarted.Snapshot()
+				return s.CommitIndex == 1 && len(s.Log) == 1
+			})
+		})
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within 2s")
+}
+
+// A new leader must not serve reads until an entry from its own term has
+// committed and the store has applied up to it.
+func TestWaitLeaderReadWaitsForCurrentTermApply(t *testing.T) {
+	old := LogEntry{Index: 1, Term: 1, Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")}}
+	leader := newTestLeader(t, "a", 2, []string{"b"}, []LogEntry{old})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunApply(ctx, func(proto.Command) {})
+
+	done := make(chan error, 1)
+	go func() { done <- leader.WaitLeaderRead(ctx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("read allowed before a current-term commit: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// new term's no-op reaches a majority
+	leader.mu.Lock()
+	leader.Log = append(leader.Log, LogEntry{Index: 2, Term: 2, Command: proto.Command{Op: proto.OpNoop}})
+	leader.matchIndex["b"] = 2
+	leader.advanceCommitLocked()
+	leader.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("read still blocked after commit and apply")
+	}
+	if got := leader.Snapshot().LastApplied; got < 2 {
+		t.Fatalf("read released with LastApplied = %d, want >= 2", got)
+	}
+}
+
+func TestWaitLeaderReadReturnsNotLeaderOnStepDown(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b"}, []LogEntry{{Index: 1, Term: 1}})
+	leader.statePath = filepath.Join(t.TempDir(), "a.raft.state")
+	done := make(chan error, 1)
+	go func() { done <- leader.WaitLeaderRead(context.Background()) }()
+	time.Sleep(20 * time.Millisecond)
+
+	// higher-term vote request deposes the leader (log not up to date: no vote)
+	if _, err := leader.HandleRequestVote(RequestVoteArgs{Term: 3, CandidateID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != ErrNotLeader {
+			t.Fatalf("err = %v, want ErrNotLeader", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read not released after step down")
+	}
 }

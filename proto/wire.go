@@ -41,6 +41,17 @@ type Command struct {
 	Op    byte
 	Key   []byte
 	Value []byte
+
+	// Writes only (SET, DEL): who sent it and that client's write number.
+	// A retried write keeps the same pair, so the state machine applies it
+	// at most once. ClientID 0 means "no dedup".
+	ClientID uint64
+	Seq      uint64
+}
+
+// IsWrite reports whether op changes the store and carries ClientID and Seq on the wire.
+func IsWrite(op byte) bool {
+	return op == OpSet || op == OpDel
 }
 
 type Response struct {

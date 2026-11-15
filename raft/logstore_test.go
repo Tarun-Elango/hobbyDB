@@ -2,6 +2,8 @@ package raft
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,5 +66,59 @@ func TestLogSurvivesRestart(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("restored entry was never applied")
 		}
+	}
+}
+
+// A node whose state file is lost (or older than its log) must not boot:
+// it would have forgotten votes it already cast.
+func TestOpenLogRejectsLogAheadOfState(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	logPath := filepath.Join(dir, "raft.log")
+
+	n, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.SetPersistentState(3, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.OpenLog(logPath); err != nil {
+		t.Fatal(err)
+	}
+	n.mu.Lock()
+	err = n.persistAppendLocked(LogEntry{Index: 1, Term: 3, Command: proto.Command{Op: proto.OpNoop}})
+	n.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.CloseLog(); err != nil {
+		t.Fatal(err)
+	}
+
+	// state file intact: boots
+	n2, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n2.OpenLog(logPath); err != nil {
+		t.Fatalf("boot with matching state: %v", err)
+	}
+	_ = n2.CloseLog()
+
+	// state file deleted: OpenNode recreates it at term 0, OpenLog must refuse
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	n3, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = n3.OpenLog(logPath)
+	if !errors.Is(err, ErrLogAheadOfState) {
+		t.Fatalf("OpenLog() error = %v, want ErrLogAheadOfState", err)
+	}
+	if got := len(n3.Snapshot().Log); got != 0 {
+		t.Fatalf("log loaded despite error: %d entries", got)
 	}
 }

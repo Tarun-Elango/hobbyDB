@@ -120,10 +120,11 @@ func (n *Node) ObserverLeader(term uint64, leaderId string) error {
 
 	n.mu.Lock()
 	if n.CurrentTerm == term {
+		if n.Role == Leader {
+			n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
+		}
 		n.Role = Follower
-
 		n.LeaderID = leaderId
-
 	}
 	n.mu.Unlock()
 	n.pokeElectionTimer()
@@ -343,7 +344,8 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 		n.LeaderID = "" // dont knwo for sure, hence will update later
 	}
 	if wasLeader && n.Role != Leader {
-		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
+		n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
+		n.pokeElectionTimer()   // re-arm the timer a leader leaves stopped
 	}
 	granted := n.CurrentTerm == term && n.VotedFor == candidateId // if the vote is for the candidate and the term is the same
 	termNow := n.CurrentTerm

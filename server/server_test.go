@@ -9,22 +9,28 @@ import (
 	"kvStore/proto"
 	"kvStore/raft"
 	"kvStore/store"
-	"kvStore/wal"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
 )
 
+// newTestServer returns a server over a single-node Raft leader whose
+// committed writes are applied to the store, as in a real node.
 func newTestServer(t *testing.T) *Server {
 	t.Helper() // tell its a helper func
 
-	log, err := wal.Open(filepath.Join(t.TempDir(), "data/wal.log"))
-	if err != nil {
-		t.Fatalf("open test WAL: %v", err)
-	}
-	s := New(store.NewStore[string, []byte](), log)
-	t.Cleanup(s.shutdown)
+	node := raft.NewNode("a")
+	node.Role = raft.Leader
+	node.CurrentTerm = 1
+	st := store.NewStore[string, []byte]()
+	s := New(st, Config{RaftNode: node})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go node.RunApply(ctx, NewStateMachine(st).Apply)
+	t.Cleanup(func() {
+		s.shutdown()
+		cancel()
+	})
 	return s
 }
 
@@ -214,7 +220,7 @@ func TestRaftFollowerWriteReturnsLeader(t *testing.T) {
 	node := raft.NewNode("b")
 	node.Role = raft.Follower
 	node.LeaderID = "a"
-	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{RaftNode: node})
+	s := New(store.NewStore[string, []byte](), Config{RaftNode: node})
 
 	response, err := s.dispatch(context.Background(), proto.Command{
 		Op: proto.OpSet, Key: []byte("k"), Value: []byte("v"),
@@ -234,7 +240,7 @@ func TestRaftFollowerWriteReturnsLeaderAddress(t *testing.T) {
 	node := raft.NewNode("b")
 	node.Role = raft.Follower
 	node.LeaderID = "a"
-	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{
+	s := New(store.NewStore[string, []byte](), Config{
 		RaftNode:    node,
 		ClientAddrs: map[string]string{"a": "127.0.0.1:9000"},
 	})
@@ -253,7 +259,7 @@ func TestRaftFollowerWriteReturnsLeaderAddress(t *testing.T) {
 func TestRaftFollowerWriteLeaderUnknown(t *testing.T) {
 	node := raft.NewNode("b")
 	node.Role = raft.Candidate
-	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{RaftNode: node})
+	s := New(store.NewStore[string, []byte](), Config{RaftNode: node})
 
 	response, err := s.dispatch(context.Background(), proto.Command{
 		Op: proto.OpDel, Key: []byte("k"),
@@ -271,7 +277,7 @@ func TestRaftLeaderWriteRepliesAfterApply(t *testing.T) {
 	node.Role = raft.Leader
 	node.CurrentTerm = 1
 	st := store.NewStore[string, []byte]()
-	s := NewWithConfig(st, nil, &Config{RaftNode: node})
+	s := New(st, Config{RaftNode: node})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -317,7 +323,7 @@ func TestReadFromLeaderRedirectsFollowerReads(t *testing.T) {
 	node := raft.NewNode("b")
 	node.Role = raft.Follower
 	node.LeaderID = "a"
-	s := NewWithConfig(store.NewStore[string, []byte](), nil, &Config{
+	s := New(store.NewStore[string, []byte](), Config{
 		RaftNode:    node,
 		ClientAddrs: map[string]string{"a": "127.0.0.1:9000"},
 	})

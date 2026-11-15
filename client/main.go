@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"kvStore/config"
 	"kvStore/proto"
@@ -160,10 +162,27 @@ type session struct {
 	writer  *bufio.Writer
 	current string
 	cursor  int
+
+	// identifies this client's writes so a retried SET/DEL is applied once
+	clientID uint64
+	lastSeq  uint64
+}
+
+// newClientID returns a random non-zero id (0 means "no dedup" on the server).
+func newClientID() uint64 {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(fmt.Sprintf("client id: %v", err))
+		}
+		if id := binary.BigEndian.Uint64(b[:]); id != 0 {
+			return id
+		}
+	}
 }
 
 func connectAny(addrs []string) (*session, error) {
-	sess := &session{members: append([]string(nil), addrs...)}
+	sess := &session{members: append([]string(nil), addrs...), clientID: newClientID()}
 	var last error
 	for _, addr := range sess.members {
 		if err := sess.connect(addr); err != nil {
@@ -223,9 +242,27 @@ func (s *session) Do(cmd proto.Command) (proto.Response, error) {
 	// before any of them can name a new leader.
 	deadline := time.Now().Add(retryWindow)
 
+	// Every attempt of this write, on any node, carries the same id and number,
+	// so the cluster applies it once even if an earlier attempt already committed.
+	if proto.IsWrite(cmd.Op) {
+		s.lastSeq++
+		cmd.ClientID, cmd.Seq = s.clientID, s.lastSeq
+	}
+
 	var lastErr error
 	failed := map[string]bool{}
-	for time.Now().Before(deadline) {
+	// resend: a redirect just connected to the leader. That one send is allowed
+	// past the window, or a command that found the leader could end as
+	// "leader unknown". Only once, so nodes pointing at each other cannot loop.
+	resend, overtime := false, false
+	for {
+		if !time.Now().Before(deadline) {
+			if !resend || overtime {
+				break
+			}
+			overtime = true
+		}
+		resend = false
 		if s.conn == nil {
 			addr, ok := s.nextAddr(failed)
 			if !ok {
@@ -266,6 +303,7 @@ func (s *session) Do(cmd proto.Command) (proto.Response, error) {
 				failed[addr] = true
 				continue
 			}
+			resend = true
 			continue
 		}
 		if s.current != "" {

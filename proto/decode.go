@@ -50,7 +50,16 @@ func DecodeCommand(r io.Reader) (Command, error) {
 	if err != nil {
 		return Command{}, err
 	}
-	return Command{Op: op, Key: key, Value: value}, nil
+	cmd := Command{Op: op, Key: key, Value: value}
+	if IsWrite(op) {
+		var buf [16]byte
+		if _, err := io.ReadFull(r, buf[:]); err != nil {
+			return Command{}, &FrameError{Stage: "client id and seq", Err: err}
+		}
+		cmd.ClientID = binary.BigEndian.Uint64(buf[:8])
+		cmd.Seq = binary.BigEndian.Uint64(buf[8:])
+	}
+	return cmd, nil
 }
 
 // Reads one Response from r, same EOF semantics as above

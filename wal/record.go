@@ -25,6 +25,11 @@ type Record struct {
 	Op    byte
 	Key   []byte
 	Value []byte
+
+	// client write identity (see proto.Command); 0, 0 when absent.
+	// Encoded as an optional 16-byte trailer only when ClientID != 0.
+	ClientID uint64
+	Seq      uint64
 }
 
 var (
@@ -35,7 +40,8 @@ var (
 // maxRecordLen guards against a corrupted or bogus length prefix causing
 // a huge allocation. Generous upper bound on payload size:
 // 8 (index) + 8 (term) + 1 (op) + 4 (keyLen) + MaxKeyLen + 4 (valLen) + MaxValueLen
-var maxRecordLen = 8 + 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen
+// + 16 (optional client id and seq)
+var maxRecordLen = 8 + 8 + 1 + 4 + MaxKeyLen + 4 + MaxValueLen + 16
 
 var (
 	ErrUnknownOp        = errors.New("wal: unknown operation")
@@ -90,6 +96,10 @@ func encodePayload(rec Record) []byte {
 	buf.Write(rec.Key)
 	_ = writeUint32(buf, uint32(len(rec.Value)))
 	buf.Write(rec.Value)
+	if rec.ClientID != 0 {
+		_ = writeUint64(buf, rec.ClientID)
+		_ = writeUint64(buf, rec.Seq)
+	}
 	return buf.Bytes()
 
 }
@@ -97,7 +107,7 @@ func encodePayload(rec Record) []byte {
 // decode one [len][payload][crc] unit from r.
 // 1. io.EOF - clean end of log, nothing more to read
 // 2. ErrIncompleteRecord - torn write, truncate here
-// 3. ErrChecksumMismatch - real corruption, fail startup
+// 3. ErrChecksumMismatch or ErrMalformedRecord - real corruption, fail startup
 func DecodeRecord(r io.Reader) (Record, error) {
 	recordLen, err := readUint32(r)
 	if err != nil {
@@ -140,13 +150,16 @@ func DecodeRecord(r io.Reader) (Record, error) {
 
 }
 
-// decodePayload parses [index][op][keyLen][key][valLen][value] from an
+// decodePayload parses [index][term][op][keyLen][key][valLen][value] from an
 // already-fully-read, already-checksum-verified byte slice.
+// Every byte of the record is on disk and its checksum matched, so a short
+// field here is not a torn write: it is corruption (or an encoder bug), and
+// must fail startup instead of being truncated like an incomplete tail.
 func decodePayload(payload []byte) (Record, error) {
 	r := bytes.NewReader(payload)
 	index, err := readUint64(r) // index
 	if err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 	if index == 0 {
 		return Record{}, ErrInvalidIndex
@@ -154,13 +167,12 @@ func decodePayload(payload []byte) (Record, error) {
 
 	term, err := readUint64(r) // raft term
 	if err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 
 	opByte, err := r.ReadByte()
 	if err != nil {
-		// shouldn't happen post-checksum verification, but defensive
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 	op := Op(opByte)
 	if op != OpSet && op != OpDel && op != OpNoop {
@@ -168,7 +180,7 @@ func decodePayload(payload []byte) (Record, error) {
 	}
 	keyLen, err := readUint32(r)
 	if err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 	if int(keyLen) > MaxKeyLen {
 		// validate before allocating
@@ -176,12 +188,12 @@ func decodePayload(payload []byte) (Record, error) {
 	}
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r, key); err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 
 	valLen, err := readUint32(r)
 	if err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
 	if int(valLen) > MaxValueLen {
 		// validate before allocating
@@ -190,10 +202,25 @@ func decodePayload(payload []byte) (Record, error) {
 
 	value := make([]byte, valLen)
 	if _, err := io.ReadFull(r, value); err != nil {
-		return Record{}, ErrIncompleteRecord
+		return Record{}, malformed("short field")
 	}
-	return Record{Index: index, Term: term, Op: byte(op), Key: key, Value: value}, nil
+	rec := Record{Index: index, Term: term, Op: byte(op), Key: key, Value: value}
 
+	// optional client id + seq trailer: nothing (v2 layout, or no client) or exactly 16 bytes
+	switch r.Len() {
+	case 0:
+	case 16:
+		rec.ClientID, _ = readUint64(r)
+		rec.Seq, _ = readUint64(r)
+	default:
+		return Record{}, malformed(fmt.Sprintf("%d unexpected trailing bytes", r.Len()))
+	}
+	return rec, nil
+
+}
+
+func malformed(reason string) error {
+	return fmt.Errorf("%w: %s", ErrMalformedRecord, reason)
 }
 
 // Because uint32 is a number that must be converted into a fixed 4-byte format,

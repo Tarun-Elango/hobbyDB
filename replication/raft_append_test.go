@@ -19,9 +19,11 @@ func TestRaftAppendEntriesRoundTrip(t *testing.T) {
 			Index: 3,
 			Term:  4,
 			Command: proto.Command{
-				Op:    proto.OpSet,
-				Key:   []byte("user"),
-				Value: []byte("ada"),
+				Op:       proto.OpSet,
+				Key:      []byte("user"),
+				Value:    []byte("ada"),
+				ClientID: 99,
+				Seq:      7,
 			},
 		}},
 	}
@@ -44,7 +46,8 @@ func TestRaftAppendEntriesRoundTrip(t *testing.T) {
 	if got.Term != args.Term || got.LeaderID != args.LeaderID || got.PrevLogIndex != args.PrevLogIndex || got.PrevLogTerm != args.PrevLogTerm || got.LeaderCommit != args.LeaderCommit {
 		t.Fatalf("header = %+v", got)
 	}
-	if len(got.Entries) != 1 || string(got.Entries[0].Command.Value) != "ada" || got.Entries[0].Term != 4 {
+	if len(got.Entries) != 1 || string(got.Entries[0].Command.Value) != "ada" || got.Entries[0].Term != 4 ||
+		got.Entries[0].Command.ClientID != 99 || got.Entries[0].Command.Seq != 7 {
 		t.Fatalf("entries = %+v", got.Entries)
 	}
 

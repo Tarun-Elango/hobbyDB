@@ -20,6 +20,8 @@ var (
 	appendEntriesBatchLimit = config.Int("raft.append.entries.batch.limit")
 	maxAppendEntriesPayload = config.Int("raft.append.entries.max.payload")
 	appendRetryBackoff      = config.Duration("raft.append.retry.backoff.ms")
+	// how often an idle leader re-sends its commit index to a caught-up peer
+	commitRefreshInterval = electionTimeoutMin
 )
 
 // AppendEntries RPC: leader copies log entries to peers and reports its commit index.
@@ -57,7 +59,7 @@ func (n *Node) logTermAtLocked(index uint64) (uint64, bool) {
 }
 
 func logEntryWireSize(entry LogEntry) int {
-	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+	return 8 + 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value) + 8 + 8 // + client id, seq
 }
 
 func cloneLogEntry(entry LogEntry) LogEntry {
@@ -65,9 +67,11 @@ func cloneLogEntry(entry LogEntry) LogEntry {
 		Index: entry.Index,
 		Term:  entry.Term,
 		Command: proto.Command{
-			Op:    entry.Command.Op,
-			Key:   append([]byte(nil), entry.Command.Key...),
-			Value: append([]byte(nil), entry.Command.Value...),
+			Op:       entry.Command.Op,
+			Key:      append([]byte(nil), entry.Command.Key...),
+			Value:    append([]byte(nil), entry.Command.Value...),
+			ClientID: entry.Command.ClientID,
+			Seq:      entry.Command.Seq,
 		},
 	}
 }
@@ -90,9 +94,11 @@ func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error)
 		Index: lastIndex + 1,
 		Term:  n.CurrentTerm,
 		Command: proto.Command{
-			Op:    cmd.Op,
-			Key:   append([]byte(nil), cmd.Key...),
-			Value: append([]byte(nil), cmd.Value...),
+			Op:       cmd.Op,
+			Key:      append([]byte(nil), cmd.Key...),
+			Value:    append([]byte(nil), cmd.Value...),
+			ClientID: cmd.ClientID,
+			Seq:      cmd.Seq,
 		},
 	}
 	if err := n.persistAppendLocked(entry); err != nil { // durable before anyone can count it
@@ -156,20 +162,21 @@ func (n *Node) replicatePeer(ctx context.Context, peer string, rpc AppendEntries
 		return
 	}
 
-	// highest commit index this peer has been told about through a successful empty send
-	var sentCommit uint64
+	// highest commit index (and the term it was sent in) this peer has been
+	// told about through a successful empty send
+	var sentCommit, sentTerm uint64
 	for {
 		args, term, lastSent, ok := n.nextAppend(peer)
 		commitOnly := uint64(0)
 		if !ok {
 			// caught up, but the peer may not know the latest commit index yet
-			args, term, commitOnly, ok = n.nextCommitUpdate(peer, sentCommit)
+			args, term, commitOnly, ok = n.nextCommitUpdate(peer, sentCommit, sentTerm)
 		}
 		if ok {
 			res, err := rpc(ctx, peer, args)
 			if err == nil {
 				if commitOnly > 0 && res.Success {
-					sentCommit = commitOnly
+					sentCommit, sentTerm = commitOnly, term
 				}
 				n.handleAppendResult(peer, term, lastSent, len(args.Entries), res)
 				continue
@@ -183,10 +190,19 @@ func (n *Node) replicatePeer(ctx context.Context, peer string, rpc AppendEntries
 			continue
 		}
 
+		// Idle. Heartbeats do not carry the commit index, so a follower that
+		// restarted (CommitIndex back to 0, or its log wiped) would otherwise
+		// stay behind until the next write. Re-send the commit index now and
+		// then; a wiped follower fails the prev-log check and nextIndex walks back.
+		refresh := time.NewTimer(commitRefreshInterval)
 		select {
 		case <-ctx.Done():
+			refresh.Stop()
 			return
 		case <-wake:
+			refresh.Stop()
+		case <-refresh.C:
+			sentCommit = 0
 		}
 	}
 }
@@ -252,12 +268,15 @@ func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool)
 // build an empty AppendEntries that only carries the leader's commit index.
 // The previous-log check uses matchIndex, so the follower can only commit
 // what it is known to hold. Returns the commit index this send tells the peer about.
-func (n *Node) nextCommitUpdate(peer string, sentCommit uint64) (AppendEntriesArgs, uint64, uint64, bool) {
+func (n *Node) nextCommitUpdate(peer string, sentCommit, sentTerm uint64) (AppendEntriesArgs, uint64, uint64, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
 	if n.Role != Leader {
 		return AppendEntriesArgs{}, 0, 0, false
+	}
+	if sentTerm != n.CurrentTerm {
+		sentCommit = 0 // told in an older term: this leader has not told the peer anything yet
 	}
 	match := n.matchIndex[peer]
 	effective := n.CommitIndex
@@ -297,10 +316,15 @@ func (n *Node) handleAppendResult(peer string, term uint64, lastSent uint64, nEn
 		}
 		return
 	}
-	if nEntries > 0 && lastSent > n.matchIndex[peer] {
-		n.matchIndex[peer] = lastSent
+	if nEntries > 0 {
+		// always move nextIndex past what was accepted, even when matchIndex is
+		// already higher (a peer that lost its log after an earlier match):
+		// otherwise the same batch is resent forever.
 		n.nextIndex[peer] = lastSent + 1
-		n.advanceCommitLocked()
+		if lastSent > n.matchIndex[peer] {
+			n.matchIndex[peer] = lastSent
+			n.advanceCommitLocked()
+		}
 	}
 }
 

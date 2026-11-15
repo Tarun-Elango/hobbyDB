@@ -12,6 +12,7 @@ import (
 //	EncodeCommand(file, cmd)
 //
 // [1 byte op][4 bytes keyLen BE][key][4 bytes valLen BE][value]
+// SET and DEL then add [8 bytes clientID BE][8 bytes seq BE].
 // 02 				<- opcode
 // 00 00 00 04 		<- key length BE
 // 6E 61 6D 65		<- Key
@@ -48,6 +49,15 @@ func EncodeCommand(w io.Writer, cmd Command) error {
 	}
 	if len(cmd.Value) > 0 {
 		if _, err := w.Write(cmd.Value); err != nil {
+			return err
+		}
+	}
+
+	if IsWrite(cmd.Op) {
+		var buf [16]byte
+		binary.BigEndian.PutUint64(buf[:8], cmd.ClientID)
+		binary.BigEndian.PutUint64(buf[8:], cmd.Seq)
+		if _, err := w.Write(buf[:]); err != nil {
 			return err
 		}
 	}
