@@ -24,14 +24,34 @@ func keysFor(valSize int) int {
 	return k
 }
 
+// startSeeded starts a node whose WAL already holds `keys` live keys of valSize.
+func startSeeded(t *testing.T, valSize int) (*serverProc, int) {
+	t.Helper()
+	dir := t.TempDir()
+	keys := keysFor(valSize)
+	if _, err := seedWAL(dir, keys, keys, valSize); err != nil {
+		t.Fatal(err)
+	}
+	return startServer(t, dir), keys
+}
+
+func perSec(n int, d time.Duration) float64 { return float64(n) / d.Seconds() }
+
+func p50p99(lats []time.Duration) string {
+	if len(lats) == 0 {
+		return "-"
+	}
+	return ms(pct(lats, 0.50)) + " / " + ms(pct(lats, 0.99))
+}
+
 // --------------------------------------------------------------- startup
 
 // TestStartup measures restart time against WAL length. The log is a churned
-// history (see seedWAL), so a 1M-record WAL holds ~100k live keys: replay cost
+// history (see seedWAL), so a 1M-record WAL holds ~90k live keys: replay cost
 // follows log length, not DB size, because nothing compacts the log.
 func TestStartup(t *testing.T) {
 	requireBench(t)
-	sizes := envInts("KV_BENCH_WAL_SIZES", []int{0, 10_000, 100_000, 1_000_000})
+	sizes := envInts("KV_BENCH_WAL_SIZES", []int{0, 100_000, 1_000_000})
 	reps := envInt("KV_BENCH_STARTUP_REPS", 3)
 	const keys, valSize = 100_000, 128
 
@@ -67,176 +87,147 @@ func TestStartup(t *testing.T) {
 				rss, walSize = p.rssMB(), p.walBytes()
 				p.stop()
 			}
-			sort.Slice(listen, func(i, j int) bool { return listen[i] < listen[j] })
-			sort.Slice(ready, func(i, j int) bool { return ready[i] < ready[j] })
-			med := func(d []time.Duration) time.Duration { return d[len(d)/2] }
-			record("Startup time vs WAL length",
-				fmt.Sprintf("Median of %d restarts, 128 B values. `listen` = process start -> client port open (WAL replay into memory). "+
-					"`ready` = process start -> first write acked (also needs the election timeout of 150-300 ms and re-applying the whole log to the store). "+
-					"Records are a churned history (90%% overwrite / 10%% delete over up to 100k keys), so live keys << records.", reps),
-				[]string{"WAL records", "WAL size", "live keys", "listen ms", "ready ms", "server RSS MiB"},
-				[]string{fmt.Sprint(n), fmt.Sprintf("%.1f MiB", float64(walSize)/(1<<20)), fmt.Sprint(live),
+			med := func(d []time.Duration) time.Duration {
+				sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
+				return d[len(d)/2]
+			}
+			record("Startup vs WAL length",
+				fmt.Sprintf("Median of %d restarts. `listen` = WAL replayed, port open. `ready` = first write acked "+
+					"(adds the 150-300 ms election + re-apply). Churned log: live keys << records.", reps),
+				[]string{"WAL records", "WAL MiB", "live keys", "listen ms", "ready ms", "RSS MiB"},
+				[]string{fmt.Sprint(n), fmt.Sprintf("%.1f", float64(walSize)/(1<<20)), fmt.Sprint(live),
 					ms(med(listen)), ms(med(ready)), fmt.Sprintf("%.0f", rss)})
-			t.Logf("records=%d listen=%s ready=%s rss=%.0fMiB", n, med(listen), med(ready), rss)
+			if n == sizes[len(sizes)-1] {
+				summarize(90, fmt.Sprintf("Restart -> ready, %d-record WAL", n),
+					fmt.Sprintf("%s ms, RSS %.0f MiB", ms(med(ready)), rss))
+			}
 		})
 	}
 }
 
-// --------------------------------------------------------------- write throughput
+// --------------------------------------------------------------- writes
 
-// TestWriteThroughput: 95% SET / 5% DEL over a fixed pre-filled keyspace
-// (overwrites + delete/recreate, no unbounded growth), per payload size and
-// client count.
+// TestWriteThroughput: 95% SET / 5% DEL over a fixed pre-filled keyspace.
+// The 128 B rows sweep connections (does throughput scale = group commit?);
+// the 16-conn rows sweep payload (is it fsync- or bandwidth-bound?).
 func TestWriteThroughput(t *testing.T) {
 	requireBench(t)
-	payloads := envInts("KV_BENCH_PAYLOADS", []int{16, 128, 1024, 4096, 65536})
-	conns := envInts("KV_BENCH_WRITE_CONNS", []int{1, 16, 64})
-	for _, size := range payloads {
-		for _, c := range conns {
-			t.Run(fmt.Sprintf("value_%dB_conns_%d", size, c), func(t *testing.T) {
-				dir := t.TempDir()
-				keys := keysFor(size)
-				if _, err := seedWAL(dir, keys, keys, size); err != nil {
-					t.Fatal(err)
-				}
-				p := startServer(t, dir)
-				defer p.stop()
-
-				res := runWorkload(t, p.addr, c, benchDuration(), keys, size, mix{readPct: 0, delPct: 5})
-				if res.errs > 0 {
-					t.Fatalf("%d request errors, last: %s", res.errs, res.lastErr)
-				}
-				secs := res.elapsed.Seconds()
-				record("Write / update throughput by payload size",
-					"95% SET / 5% DEL on a pre-filled keyspace (80% of ops hit the hottest 20% of keys). Synchronous clients, one request in flight per connection. "+
-						"MiB/s counts value bytes of SETs only.",
-					[]string{"value size", "conns", "keys", "ops/s", "MiB/s", "p50 ms", "p99 ms", "WAL growth MiB", "RSS MiB"},
-					[]string{humanBytes(size), fmt.Sprint(c), fmt.Sprint(keys),
-						fmt.Sprintf("%.0f", float64(res.writes.count)/secs),
-						fmt.Sprintf("%.2f", float64(res.valueB)/(1<<20)/secs),
-						ms(pct(res.writes.lats, 0.50)), ms(pct(res.writes.lats, 0.99)),
-						fmt.Sprintf("%.1f", float64(p.walBytes())/(1<<20)-float64(keys*(size+40))/(1<<20)),
-						fmt.Sprintf("%.0f", p.rssMB())})
-			})
-		}
+	cases := []struct{ size, conns int }{
+		{128, 1}, {128, 16}, {128, 64},
+		{4096, 16}, {65536, 16},
 	}
-}
-
-// --------------------------------------------------------------- mixed read/write
-
-// TestMixedThroughput: GET-heavy and balanced mixes on a pre-filled keyspace.
-func TestMixedThroughput(t *testing.T) {
-	requireBench(t)
-	payloads := envInts("KV_BENCH_MIXED_PAYLOADS", []int{128, 4096})
-	readPcts := envInts("KV_BENCH_READ_PCTS", []int{100, 95, 80, 50})
-	conns := envInt("KV_BENCH_MIXED_CONNS", 32)
-
-	type c struct{ size, readPct, conns int }
-	var cases []c
-	for _, s := range payloads {
-		for _, r := range readPcts {
-			cases = append(cases, c{s, r, conns})
-		}
-	}
-	// connection-count sweep on a 95/5 mix at 128 B
-	for _, n := range envInts("KV_BENCH_MIXED_CONN_SWEEP", []int{1, 8, 128}) {
-		cases = append(cases, c{128, 95, n})
-	}
-
 	for _, cs := range cases {
-		t.Run(fmt.Sprintf("value_%dB_read%d_conns_%d", cs.size, cs.readPct, cs.conns), func(t *testing.T) {
-			dir := t.TempDir()
-			keys := keysFor(cs.size)
-			if _, err := seedWAL(dir, keys, keys, cs.size); err != nil {
-				t.Fatal(err)
-			}
-			p := startServer(t, dir)
+		t.Run(fmt.Sprintf("value_%dB_conns_%d", cs.size, cs.conns), func(t *testing.T) {
+			p, keys := startSeeded(t, cs.size)
 			defer p.stop()
-
-			writePct := 100 - cs.readPct
-			res := runWorkload(t, p.addr, cs.conns, benchDuration(), keys, cs.size,
-				mix{readPct: cs.readPct, delPct: writePct / 10})
+			res := runWorkload(t, p.addr, cs.conns, benchDuration(), keys, cs.size, mix{delPct: 5})
 			if res.errs > 0 {
 				t.Fatalf("%d request errors, last: %s", res.errs, res.lastErr)
 			}
-			secs := res.elapsed.Seconds()
-			hit := "-"
-			if res.reads.count > 0 {
-				hit = fmt.Sprintf("%.0f%%", 100*float64(res.hits)/float64(res.reads.count))
+			ops := perSec(res.writes.count, res.elapsed)
+			record("Writes (SET/DEL 95/5)",
+				"Synchronous clients, one request in flight per connection. MiB/s = SET value bytes.",
+				[]string{"value", "conns", "ops/s", "MiB/s", "p50 / p99 ms"},
+				[]string{humanBytes(cs.size), fmt.Sprint(cs.conns), fmt.Sprintf("%.0f", ops),
+					fmt.Sprintf("%.2f", float64(res.valueB)/(1<<20)/res.elapsed.Seconds()),
+					p50p99(res.writes.lats)})
+			switch {
+			case cs.size == 128 && cs.conns == 1:
+				summarize(10, "Write, 1 conn (per-op fsync cost)",
+					fmt.Sprintf("%.0f ops/s, p50 / p99 %s ms", ops, p50p99(res.writes.lats)))
+			case cs.size == 128 && cs.conns == 64:
+				summarize(20, "Write, 64 conns (concurrency scaling)",
+					fmt.Sprintf("%.0f ops/s, p50 / p99 %s ms", ops, p50p99(res.writes.lats)))
+			case cs.size == 65536:
+				summarize(30, "Write bandwidth, 64 KiB values",
+					fmt.Sprintf("%.1f MiB/s", float64(res.valueB)/(1<<20)/res.elapsed.Seconds()))
 			}
-			wp50, wp99 := "-", "-"
-			if res.writes.count > 0 {
-				wp50, wp99 = ms(pct(res.writes.lats, 0.50)), ms(pct(res.writes.lats, 0.99))
-			}
-			rp50, rp99 := "-", "-"
-			if res.reads.count > 0 {
-				rp50, rp99 = ms(pct(res.reads.lats, 0.50)), ms(pct(res.reads.lats, 0.99))
-			}
-			record("Mixed read/write throughput",
-				"Pre-filled keyspace, GET vs SET/DEL (writes are ~90% SET / 10% DEL), 80/20 hot-key skew. `read mix` is the GET percentage. "+
-					"Reads are served straight from the in-memory store (server.read.from=any); writes go through Raft + fsync.",
-				[]string{"value size", "read mix", "conns", "total ops/s", "reads/s", "writes/s", "GET hit rate", "read p50 / p99 ms", "write p50 / p99 ms"},
-				[]string{humanBytes(cs.size), fmt.Sprintf("%d/%d", cs.readPct, writePct), fmt.Sprint(cs.conns),
-					fmt.Sprintf("%.0f", float64(res.total())/secs),
-					fmt.Sprintf("%.0f", float64(res.reads.count)/secs),
-					fmt.Sprintf("%.0f", float64(res.writes.count)/secs), hit,
-					rp50 + " / " + rp99, wp50 + " / " + wp99})
 		})
 	}
 }
 
-// --------------------------------------------------------------- reads under write load
+// --------------------------------------------------------------- reads
 
-// TestReadsUnderWriteLoad separates the two client populations: dedicated
-// reader connections run flat out while dedicated writer connections keep
-// writing. Unlike TestMixedThroughput (where one connection alternates GET
-// and SET, so a slow fsync stalls its own reads), this shows how much a
-// write stream slows down reads on OTHER connections.
-func TestReadsUnderWriteLoad(t *testing.T) {
+// TestReads: dedicated reader connections run flat out while 0 / 1 / 16
+// dedicated writer connections write. Shows peak read rate and whether a
+// write stream slows reads on OTHER connections.
+func TestReads(t *testing.T) {
 	requireBench(t)
-	readers := envInt("KV_BENCH_READERS", 32)
-	for _, size := range envInts("KV_BENCH_MIXED_PAYLOADS", []int{128, 4096}) {
-		for _, writers := range envInts("KV_BENCH_WRITERS", []int{0, 1, 16}) {
-			t.Run(fmt.Sprintf("value_%dB_writers_%d", size, writers), func(t *testing.T) {
-				dir := t.TempDir()
-				keys := keysFor(size)
-				if _, err := seedWAL(dir, keys, keys, size); err != nil {
-					t.Fatal(err)
-				}
-				p := startServer(t, dir)
-				defer p.stop()
+	const readers, size = 32, 128
+	for _, writers := range []int{0, 1, 16} {
+		t.Run(fmt.Sprintf("writers_%d", writers), func(t *testing.T) {
+			p, keys := startSeeded(t, size)
+			defer p.stop()
 
-				var rres, wres workloadResult
-				var wg sync.WaitGroup
+			var rres, wres workloadResult
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rres = runWorkload(t, p.addr, readers, benchDuration(), keys, size, mix{readPct: 100})
+			}()
+			if writers > 0 {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					rres = runWorkload(t, p.addr, readers, benchDuration(), keys, size, mix{readPct: 100})
+					wres = runWorkload(t, p.addr, writers, benchDuration(), keys, size, mix{delPct: 5})
 				}()
-				if writers > 0 {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						wres = runWorkload(t, p.addr, writers, benchDuration(), keys, size, mix{delPct: 5})
-					}()
-				}
-				wg.Wait()
-				if rres.errs+wres.errs > 0 {
-					t.Fatalf("request errors: %s %s", rres.lastErr, wres.lastErr)
-				}
-				wps, wp50, wp99 := "-", "-", "-"
-				if writers > 0 {
-					wps = fmt.Sprintf("%.0f", float64(wres.writes.count)/wres.elapsed.Seconds())
-					wp50, wp99 = ms(pct(wres.writes.lats, 0.5)), ms(pct(wres.writes.lats, 0.99))
-				}
-				record("Reads while writers are active (dedicated connections)",
-					"Reader connections only GET, writer connections only SET/DEL (95/5), all hitting the same pre-filled keyspace at the same time.",
-					[]string{"value size", "reader conns", "writer conns", "reads/s", "read p50 / p99 ms", "writes/s", "write p50 / p99 ms"},
-					[]string{humanBytes(size), fmt.Sprint(readers), fmt.Sprint(writers),
-						fmt.Sprintf("%.0f", float64(rres.reads.count)/rres.elapsed.Seconds()),
-						ms(pct(rres.reads.lats, 0.5)) + " / " + ms(pct(rres.reads.lats, 0.99)),
-						wps, wp50 + " / " + wp99})
-			})
-		}
+			}
+			wg.Wait()
+			if rres.errs+wres.errs > 0 {
+				t.Fatalf("request errors: %s %s", rres.lastErr, wres.lastErr)
+			}
+			reads := perSec(rres.reads.count, rres.elapsed)
+			wps := "-"
+			if writers > 0 {
+				wps = fmt.Sprintf("%.0f", perSec(wres.writes.count, wres.elapsed))
+			}
+			record("Reads under write load (128 B, 32 reader conns)",
+				"Readers only GET, writers only SET/DEL, separate connections, same keyspace, at the same time.",
+				[]string{"writer conns", "reads/s", "read p50 / p99 ms", "writes/s", "write p50 / p99 ms"},
+				[]string{fmt.Sprint(writers), fmt.Sprintf("%.0f", reads), p50p99(rres.reads.lats),
+					wps, p50p99(wres.writes.lats)})
+			switch writers {
+			case 0:
+				summarize(40, "Read, 32 conns, no writers",
+					fmt.Sprintf("%.0f ops/s, p50 / p99 %s ms", reads, p50p99(rres.reads.lats)))
+			case 16:
+				summarize(50, "Read, 32 conns, 16 writers active",
+					fmt.Sprintf("%.0f ops/s, p50 / p99 %s ms", reads, p50p99(rres.reads.lats)))
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------- mixed
+
+// TestMixed: every connection interleaves GET and SET/DEL (closed loop), the
+// shape of a typical app. Throughput here is set by how long each connection
+// waits on its own writes.
+func TestMixed(t *testing.T) {
+	requireBench(t)
+	const conns, size = 32, 128
+	for _, readPct := range []int{95, 50} {
+		t.Run(fmt.Sprintf("read%d", readPct), func(t *testing.T) {
+			p, keys := startSeeded(t, size)
+			defer p.stop()
+			writePct := 100 - readPct
+			res := runWorkload(t, p.addr, conns, benchDuration(), keys, size,
+				mix{readPct: readPct, delPct: writePct / 10})
+			if res.errs > 0 {
+				t.Fatalf("%d request errors, last: %s", res.errs, res.lastErr)
+			}
+			total := perSec(res.total(), res.elapsed)
+			record("Mixed (128 B, 32 conns, GET + SET/DEL on each conn)",
+				"Closed loop: a connection's next GET waits for its previous write, so write latency caps total ops/s.",
+				[]string{"read/write", "total ops/s", "reads/s", "writes/s", "read p50 / p99 ms", "write p50 / p99 ms"},
+				[]string{fmt.Sprintf("%d/%d", readPct, writePct), fmt.Sprintf("%.0f", total),
+					fmt.Sprintf("%.0f", perSec(res.reads.count, res.elapsed)),
+					fmt.Sprintf("%.0f", perSec(res.writes.count, res.elapsed)),
+					p50p99(res.reads.lats), p50p99(res.writes.lats)})
+			if readPct == 95 {
+				summarize(60, "Mixed 95/5, 32 conns", fmt.Sprintf("%.0f ops/s", total))
+			}
+		})
 	}
 }

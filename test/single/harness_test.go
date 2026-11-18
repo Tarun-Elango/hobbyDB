@@ -5,15 +5,17 @@
 // numbers include the whole path: TCP -> Raft propose (fsync'd WAL append) ->
 // commit -> apply -> response.
 //
-// They are slow, so they only run when KV_BENCH=1 (see README block in
-// result.md or the run instructions in the PR/chat).
+// They are slow, so they only run when KV_BENCH=1. Each run overwrites
+// result.md with a summary table plus one table per test.
 package single
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"kvStore/proto"
+	"kvStore/raft"
 	"kvStore/wal"
 	"math/rand"
 	"net"
@@ -107,12 +109,14 @@ func envInts(key string, def []int) []int {
 }
 
 // benchDuration is the measured window of each throughput case.
-func benchDuration() time.Duration { return envDuration("KV_BENCH_DUR", 5*time.Second) }
+func benchDuration() time.Duration { return envDuration("KV_BENCH_DUR", 3*time.Second) }
 
 // ---------------------------------------------------------------- server process
 
 type serverProc struct {
 	cmd        *exec.Cmd
+	exited     chan struct{} // closed when the process exits
+	stderr     *bytes.Buffer
 	addr       string
 	walPath    string
 	dir        string
@@ -148,9 +152,21 @@ func startServer(t testing.TB, dir string) *serverProc {
 		"-wal", p.walPath,
 	)
 	p.cmd.Dir = repoRoot // so config finds settings.properties
+	p.stderr = &bytes.Buffer{}
+	p.cmd.Stderr = &lockedWriter{w: p.stderr}
 	p.startedAt = time.Now()
 	if err := p.cmd.Start(); err != nil {
 		t.Fatal(err)
+	}
+	p.exited = make(chan struct{})
+	go func() { _ = p.cmd.Wait(); close(p.exited) }()
+	dead := func() bool {
+		select {
+		case <-p.exited:
+			return true
+		default:
+			return false
+		}
 	}
 
 	deadline := time.Now().Add(10 * time.Minute)
@@ -160,6 +176,9 @@ func startServer(t testing.TB, dir string) *serverProc {
 		if err == nil {
 			conn = c
 			break
+		}
+		if dead() {
+			t.Fatalf("server exited before listening:\n%s", p.stderr.String())
 		}
 		if time.Now().After(deadline) {
 			p.kill()
@@ -176,9 +195,9 @@ func startServer(t testing.TB, dir string) *serverProc {
 		if err == nil && resp.Status == proto.StatusOk {
 			break
 		}
-		if err != nil || time.Now().After(deadline) {
+		if err != nil || dead() || time.Now().After(deadline) {
 			p.kill()
-			t.Fatalf("server never became ready: status=%v err=%v", resp.Status, err)
+			t.Fatalf("server never became ready: status=%v err=%v\n%s", resp.Status, err, p.stderr.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -189,19 +208,28 @@ func startServer(t testing.TB, dir string) *serverProc {
 // stop sends SIGTERM and waits for a clean exit.
 func (p *serverProc) stop() {
 	_ = p.cmd.Process.Signal(syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() { _ = p.cmd.Wait(); close(done) }()
 	select {
-	case <-done:
+	case <-p.exited:
 	case <-time.After(60 * time.Second):
-		_ = p.cmd.Process.Kill()
-		<-done
+		p.kill()
 	}
 }
 
 func (p *serverProc) kill() {
 	_ = p.cmd.Process.Kill()
-	_ = p.cmd.Wait()
+	<-p.exited
+}
+
+// lockedWriter lets the exec copy goroutine and the test read stderr safely.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(b)
 }
 
 // rssMB is the resident memory of the server process.
@@ -313,6 +341,14 @@ func seedWAL(dir string, records, keys, valSize int) (liveKeys int, err error) {
 		}
 	}
 	if err := w.Flush(); err != nil {
+		return 0, err
+	}
+	// The node refuses a log whose last term is ahead of the persisted term.
+	state, err := raft.EncodePersistentState(raft.PersistentState{CurrentTerm: 1})
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "n1.wal-raft.state"), state, 0o600); err != nil {
 		return 0, err
 	}
 	for _, l := range live {
@@ -502,10 +538,16 @@ type table struct {
 	rows   [][]string
 }
 
+type headline struct {
+	order         int
+	metric, value string
+}
+
 var (
-	reportMu sync.Mutex
-	tables   []*table
-	byTitle  = map[string]*table{}
+	reportMu  sync.Mutex
+	tables    []*table
+	byTitle   = map[string]*table{}
+	headlines []headline
 )
 
 // record adds a row to a named table; tables are written to result.md at the end.
@@ -521,6 +563,24 @@ func record(title, note string, header []string, row []string) {
 	tb.rows = append(tb.rows, row)
 }
 
+// summarize adds one headline number to the summary table (sorted by order).
+func summarize(order int, metric, value string) {
+	reportMu.Lock()
+	defer reportMu.Unlock()
+	headlines = append(headlines, headline{order, metric, value})
+}
+
+func writeTable(b *strings.Builder, header []string, rows [][]string) {
+	b.WriteString("| " + strings.Join(header, " | ") + " |\n")
+	b.WriteString("|" + strings.Repeat("---|", len(header)) + "\n")
+	for _, r := range rows {
+		b.WriteString("| " + strings.Join(r, " | ") + " |\n")
+	}
+	b.WriteString("\n")
+}
+
+// writeReport overwrites result.md with this run (git history keeps old runs)
+// and prints the summary to stdout.
 func writeReport() {
 	reportMu.Lock()
 	defer reportMu.Unlock()
@@ -528,32 +588,35 @@ func writeReport() {
 		return
 	}
 	var b strings.Builder
-	if st, err := os.Stat(resultFile); err != nil || st.Size() == 0 {
-		b.WriteString("# Single-node benchmark results\n\n")
-		b.WriteString("Black-box runs of one `cmd/server` node (no peers) over TCP. Every write is an fsync'd Raft-log append.\n")
-		b.WriteString("Each run is appended below; see `harness_test.go` for how the workloads are built.\n\n")
+	b.WriteString("# Single-node benchmark\n\n")
+	fmt.Fprintf(&b, "%s · %s/%s, %d CPUs, %s · %s per throughput case\n\n",
+		time.Now().Format("2006-01-02 15:04"), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(),
+		runtime.Version(), benchDuration())
+	b.WriteString("One `cmd/server` node over TCP; every write is an fsync'd Raft-log append. Latencies are client-side.\n\n")
+
+	if len(headlines) > 0 {
+		sort.SliceStable(headlines, func(i, j int) bool { return headlines[i].order < headlines[j].order })
+		rows := make([][]string, len(headlines))
+		for i, h := range headlines {
+			rows[i] = []string{h.metric, h.value}
+		}
+		b.WriteString("## Summary\n\n")
+		writeTable(&b, []string{"metric", "result"}, rows)
+		fmt.Println()
+		for _, r := range rows {
+			fmt.Printf("  %-40s %s\n", r[0], r[1])
+		}
 	}
-	fmt.Fprintf(&b, "## Run %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(&b, "- Machine: %s/%s, %d CPUs, %s\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.Version())
-	fmt.Fprintf(&b, "- Measured window per throughput case: %s\n\n", benchDuration())
 	for _, tb := range tables {
-		fmt.Fprintf(&b, "### %s\n\n", tb.title)
+		fmt.Fprintf(&b, "## %s\n\n", tb.title)
 		if tb.note != "" {
 			b.WriteString(tb.note + "\n\n")
 		}
-		b.WriteString("| " + strings.Join(tb.header, " | ") + " |\n")
-		b.WriteString("|" + strings.Repeat("---|", len(tb.header)) + "\n")
-		for _, r := range tb.rows {
-			b.WriteString("| " + strings.Join(r, " | ") + " |\n")
-		}
-		b.WriteString("\n")
+		writeTable(&b, tb.header, tb.rows)
 	}
-	f, err := os.OpenFile(resultFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
+	if err := os.WriteFile(resultFile, []byte(b.String()), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "write report:", err)
 		return
 	}
-	defer f.Close()
-	_, _ = io.WriteString(f, b.String())
-	fmt.Fprintf(os.Stderr, "\nresults appended to %s\n", resultFile)
+	fmt.Fprintf(os.Stderr, "\nresults written to %s\n", resultFile)
 }
