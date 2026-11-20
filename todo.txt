@@ -64,6 +64,7 @@ never, worst case: whatever the OS hadn’t flushed
 
 WAL optimization: Batch writes to disk (group commit)
 Queue concurrent writes through a single ordered writer. Collect a batch up to a configurable byte/count limit or short time limit, append its WAL records together, and call file.Sync() once per batch instead of once per command. Preserve index ordering and apply writes only after the batch sync succeeds; reply success only after the required durability and replication conditions are met. Restructure the current writeMu path so requests can join a batch while earlier requests wait for durability. Bound the queue for backpressure, propagate append/sync failures to affected requests, and drain pending writes on graceful shutdown. Measure throughput and latency to choose batch limits.
+increase batch when follower is catching up with the leader.
 
 allow all followers to be always upto date with the leader. quorum = all nodes.
 
@@ -84,3 +85,6 @@ simple health check endpoint that returns 200 if the node is healthy, 500 if it 
 
 expand to on disk structure, option available to enable/disable.
 
+
+Raft: fix leader flapping under concurrent write load
+With 5 nodes, writes hold ~80/s at 1-8 concurrent writers, then fall to 41 / 9 / 1 writes/s at 16 / 32 / 64 conns with hundreds of NotLeader redirects per run (see test/multi/perf/result.md). The cluster spends its time re-electing. Likely cause (unverified): heartbeats or the follower's election-timer reset wait behind batch fsyncs that exceed the 150 ms election timeout; the 80 ms replication.rpc.attempt.timeout.ms is also tight for an fsync'd batch. Once fixed, rerun the slow-follower perf test.
