@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvStore Cluster Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@800&family=Barlow+Condensed:wght@500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="title-block">
+    <div class="eyebrow">RAFT REPLICATED KEY/VALUE STORE · 分散キーバリューストア</div>
+    <h1>CLUSTER <span>MONITOR</span></h1>
+  </div>
+  <dl class="summary">
+    <div><dt>LINK</dt><dd id="link-state" class="pill">—</dd></div>
+    <div><dt>TERM</dt><dd id="sum-term">—</dd></div>
+    <div><dt>LEADER</dt><dd id="sum-leader">—</dd></div>
+    <div><dt>QUORUM</dt><dd id="sum-quorum">—</dd></div>
+    <div><dt>CONNECTED</dt><dd id="sum-conn">—</dd></div>
+  </dl>
+</header>
+
+<div class="stripe" aria-hidden="true"></div>
+
+<main>
+  <section class="nodes-section">
+    <h2 class="sect"><span class="sect-no">01</span>NODES <small>ノード状態</small></h2>
+    <div id="nodes" class="nodes"></div>
+  </section>
+
+  <div class="lower">
+    <section class="console-section">
+      <h2 class="sect"><span class="sect-no">02</span>KV CONSOLE <small>コンソール</small></h2>
+      <div class="console">
+        <div id="console-out" class="console-out" aria-live="polite"></div>
+        <form id="console-form" class="console-in" autocomplete="off">
+          <label for="cmd" class="prompt">store&gt;</label>
+          <input id="cmd" name="cmd" spellcheck="false" placeholder="set key value · get key · del key · len · ping">
+          <button type="submit" class="btn btn-exec">EXEC</button>
+        </form>
+        <div class="quick">
+          <button type="button" data-fill="set ">SET</button>
+          <button type="button" data-fill="get ">GET</button>
+          <button type="button" data-fill="del ">DEL</button>
+          <button type="button" data-run="len">LEN</button>
+          <button type="button" data-run="ping">PING</button>
+          <button type="button" data-clear>CLEAR</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="log-section">
+      <h2 class="sect"><span class="sect-no">03</span>EVENT LOG <small>事象記録</small></h2>
+      <div class="log-filters" role="group" aria-label="Filter events">
+        <button type="button" class="chip on" data-kind="all">ALL</button>
+        <button type="button" class="chip" data-kind="election">ELECTION</button>
+        <button type="button" class="chip" data-kind="redirect">REDIRECT</button>
+        <button type="button" class="chip" data-kind="node">NODE</button>
+        <button type="button" class="chip" data-kind="error">ERROR</button>
+      </div>
+      <ol id="log" class="log"></ol>
+    </section>
+  </div>
+</main>
+
+<footer class="foot">
+  <span id="foot-mode">—</span>
+  <span>polled every 1s · pushed over SSE</span>
+</footer>
+
+<template id="node-tpl">
+  <article class="node">
+    <div class="node-head">
+      <div class="hex"><span class="node-id"></span></div>
+      <div class="node-meta">
+        <div class="node-addr"></div>
+        <div class="node-role"></div>
+      </div>
+      <div class="conn-tag" title="Console commands are sent to this node">CONNECTED</div>
+    </div>
+    <dl class="node-stats">
+      <div><dt>TERM</dt><dd class="v-term"></dd></div>
+      <div><dt>STATUS</dt><dd class="v-up"></dd></div>
+      <div><dt>SEES LEADER</dt><dd class="v-leader"></dd></div>
+    </dl>
+    <div class="node-actions">
+      <button type="button" class="btn" data-act="start">START</button>
+      <button type="button" class="btn btn-danger" data-act="kill">KILL</button>
+      <button type="button" class="btn" data-act="restart">RESTART</button>
+    </div>
+  </article>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
