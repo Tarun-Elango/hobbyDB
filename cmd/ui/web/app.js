@@ -14,6 +14,11 @@
 //   POST /api/nodes/{id}/{start|kill|restart}
 //        -> {"ok":true} or {"ok":false,"error":"..."}
 //
+//   POST   /api/nodes                 body {"id","clientAddr","replAddr","wal","pprofAddr","verbose"}  (add node)
+//   PUT    /api/nodes/{id}/config     same body, applied on restart                                   (edit node)
+//   DELETE /api/nodes/{id}                                                                           (remove node)
+//        -> {"ok":true} or {"ok":false,"error":"..."}
+//
 // Open the page with ?mock (or straight from disk) to run a simulated cluster instead.
 
 (() => {
@@ -62,6 +67,7 @@
         card.querySelectorAll("[data-act]").forEach((b) =>
           b.addEventListener("click", () => nodeAction(n.id, b.dataset.act))
         );
+        $("[data-cfg]", card).addEventListener("click", () => openNodeDialog(n.id));
         cards.set(n.id, card);
         nodesEl.appendChild(card);
       }
@@ -82,6 +88,7 @@
       $('[data-act="start"]', card).disabled = busy || n.up;
       $('[data-act="kill"]', card).disabled = busy || !n.up;
       $('[data-act="restart"]', card).disabled = busy;
+      $("[data-cfg]", card).disabled = busy;
     }
     for (const [id, card] of cards) {
       if (!seen.has(id)) { card.remove(); cards.delete(id); }
@@ -221,6 +228,185 @@
     })
   );
 
+  // ---------- tool modals (UI only — backend not wired yet) ----------
+
+  document.querySelectorAll("[data-open]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const dlg = document.getElementById(b.dataset.open);
+      if (dlg.id === "compare-dlg") renderCompareRows();
+      dlg.showModal();
+    })
+  );
+  document.querySelectorAll("dialog.modal").forEach((dlg) => {
+    dlg.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => dlg.close()));
+    dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); }); // backdrop click
+  });
+
+  function renderCompareRows() {
+    const rows = $("#cmp-rows");
+    const nodes = (lastState && lastState.nodes) || [];
+    if (!nodes.length) { rows.innerHTML = '<tr><td colspan="6" class="cmp-empty">no nodes</td></tr>'; return; }
+    rows.innerHTML = "";
+    for (const n of nodes) {
+      const tr = document.createElement("tr");
+      const cells = [
+        [n.id, ""],
+        [n.up ? "UP" : "DOWN", n.up ? "ok" : "bad"],
+        [n.term ?? "—", ""],
+        ["—", "muted"],
+        ["—", "muted"],
+        [n.up ? "—" : "SKIP", "muted"],
+      ];
+      for (const [text, cls] of cells) {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (cls) td.className = cls;
+        tr.appendChild(td);
+      }
+      rows.appendChild(tr);
+    }
+  }
+
+  $("#cmp-run").addEventListener("click", () => {
+    renderCompareRows();
+    const v = $("#cmp-verdict");
+    v.className = "verdict pending";
+    v.textContent = "NOT CONNECTED — BACKEND TODO";
+  });
+
+  $("#test-run").addEventListener("click", () => {
+    const out = $("#test-out");
+    const picked = [...document.querySelectorAll("#suites input:checked")];
+    if (!picked.length) { out.textContent = "no suites selected"; return; }
+    out.textContent = picked.map((i) => `$ go test ./test/${i.value}/...\n  (not connected — backend TODO)`).join("\n");
+  });
+
+  // ---------- node settings (add / edit / remove) ----------
+
+  const nodeDlg = $("#node-dlg");
+  const nodeForm = $("#node-form");
+  const nodeCfg = new Map(); // id -> last saved settings (the server doesn't report these yet)
+  let editingId = null; // null = adding a new node
+
+  const ADDR_RE = /^[A-Za-z0-9.\-]*:\d{1,5}$/; // host:port, host may be empty (":9000")
+
+  function splitAddr(addr) {
+    const i = (addr || "").lastIndexOf(":");
+    return i < 0 ? ["127.0.0.1", 0] : [addr.slice(0, i) || "127.0.0.1", Number(addr.slice(i + 1))];
+  }
+
+  function defaultsFor(id, addr) {
+    const [host, port] = splitAddr(addr);
+    return { id, clientAddr: addr, replAddr: `${host}:${port + 1}`, wal: `data/${id}.wal`, pprofAddr: "", verbose: false };
+  }
+
+  function suggestNew() {
+    const nodes = (lastState && lastState.nodes) || [];
+    const ids = new Set(nodes.map((n) => n.id));
+    let k = nodes.length + 1;
+    while (ids.has(`n${k}`)) k++;
+    const ports = nodes.map((n) => splitAddr(n.addr)[1]).filter(Boolean);
+    const port = ports.length ? Math.max(...ports) + 10 : 9000;
+    return defaultsFor(`n${k}`, `127.0.0.1:${port}`);
+  }
+
+  function openNodeDialog(id) {
+    editingId = id;
+    const node = id && lastState?.nodes.find((n) => n.id === id);
+    const cfg = id ? nodeCfg.get(id) || defaultsFor(id, node?.addr) : suggestNew();
+    for (const el of nodeForm.elements) {
+      if (!el.name) continue;
+      if (el.type === "checkbox") el.checked = !!cfg[el.name];
+      else el.value = cfg[el.name] ?? "";
+      el.classList.remove("invalid");
+    }
+    nodeForm.elements.id.readOnly = !!id;
+    $("#node-dlg-badge").textContent = id || "+";
+    $("#node-dlg-heading").textContent = id ? `EDIT ${id.toUpperCase()}` : "ADD NODE";
+    $("#node-dlg-sub").textContent = id ? "接続設定" : "ノード追加";
+    $("#node-submit").textContent = id ? "SAVE & RESTART" : "ADD NODE";
+    $("#node-remove").hidden = !id;
+    $("#node-dlg-note").textContent = id
+      ? (node?.up ? `${id} restarts to apply new settings. Its Raft state is kept in the WAL.` : "")
+      : "The node starts as a follower and catches up from the leader.";
+    $("#node-dlg-error").textContent = "";
+    nodeDlg.showModal();
+    (id ? nodeForm.elements.clientAddr : nodeForm.elements.id).focus();
+  }
+
+  function readNodeForm() {
+    const f = nodeForm.elements;
+    const cfg = {
+      id: f.id.value.trim(), clientAddr: f.clientAddr.value.trim(), replAddr: f.replAddr.value.trim(),
+      wal: f.wal.value.trim(), pprofAddr: f.pprofAddr.value.trim(), verbose: f.verbose.checked,
+    };
+    const errs = [];
+    const bad = (name, msg) => { f[name].classList.add("invalid"); errs.push(msg); };
+    for (const el of f) el.classList?.remove("invalid");
+
+    const others = ((lastState && lastState.nodes) || []).filter((n) => n.id !== editingId);
+    if (!/^[A-Za-z0-9_-]{1,16}$/.test(cfg.id)) bad("id", "Node ID: use 1–16 letters, digits, - or _.");
+    else if (!editingId && others.some((n) => n.id === cfg.id)) bad("id", `Node ID: ${cfg.id} already exists.`);
+    if (!ADDR_RE.test(cfg.clientAddr)) bad("clientAddr", "Client address: use host:port, e.g. 127.0.0.1:9030.");
+    if (!ADDR_RE.test(cfg.replAddr)) bad("replAddr", "Replication address: use host:port.");
+    if (cfg.pprofAddr && !ADDR_RE.test(cfg.pprofAddr)) bad("pprofAddr", "Pprof address: use host:port or leave it empty.");
+    if (cfg.clientAddr && cfg.clientAddr === cfg.replAddr) bad("replAddr", "Client and replication addresses must differ.");
+    if (others.some((n) => n.addr === cfg.clientAddr)) bad("clientAddr", `Client address: ${cfg.clientAddr} is used by another node.`);
+    return { cfg, errs };
+  }
+
+  async function submitNode(call, busyLabel) {
+    const btns = nodeDlg.querySelectorAll(".modal-foot .btn");
+    const submit = $("#node-submit");
+    const label = submit.textContent;
+    btns.forEach((b) => (b.disabled = true));
+    submit.textContent = busyLabel;
+    try {
+      const res = await call();
+      if (!res.ok) throw new Error(res.error || "request failed");
+      nodeDlg.close();
+      return true;
+    } catch (e) {
+      $("#node-dlg-error").textContent = `Not saved: ${e.message}`;
+      return false;
+    } finally {
+      btns.forEach((b) => (b.disabled = false));
+      submit.textContent = label;
+    }
+  }
+
+  $("#add-slot").addEventListener("click", () => openNodeDialog(null));
+
+  nodeForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const { cfg, errs } = readNodeForm();
+    $("#node-dlg-error").textContent = errs.join(" ");
+    if (errs.length) { nodeForm.querySelector(".invalid")?.focus(); return; }
+    const isNew = !editingId;
+    const ok = await submitNode(
+      () => (isNew ? api.addNode(cfg) : api.updateNode(cfg.id, cfg)),
+      isNew ? "ADDING…" : "SAVING…"
+    );
+    if (ok) nodeCfg.set(cfg.id, cfg);
+  });
+
+  $("#node-remove").addEventListener("click", async () => {
+    const id = editingId;
+    const btn = $("#node-remove");
+    if (btn.dataset.confirm !== id) { // two-step: first click arms, second click removes
+      btn.dataset.confirm = id;
+      btn.textContent = `CONFIRM REMOVE ${id.toUpperCase()}`;
+      return;
+    }
+    const ok = await submitNode(() => api.removeNode(id), "REMOVING…");
+    if (ok) nodeCfg.delete(id);
+  });
+  nodeDlg.addEventListener("close", () => {
+    const btn = $("#node-remove");
+    delete btn.dataset.confirm;
+    btn.textContent = "REMOVE NODE";
+  });
+
   logEl.innerHTML = '<li class="empty">waiting for events…</li>';
   print("kvStore console — commands: set <key> <value>, get <key>, del <key>, len, ping", "hint");
   $("#foot-mode").textContent = useMock ? "MOCK CLUSTER · SIMULATED" : `LIVE · ${location.host}`;
@@ -229,9 +415,9 @@
   // ---------- live backend ----------
 
   function makeRemote() {
-    async function post(url, body) {
+    async function post(url, body, method = "POST") {
       const r = await fetch(url, {
-        method: "POST",
+        method,
         headers: { "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined,
       });
@@ -242,6 +428,9 @@
     return {
       kv: (cmd) => post("/api/kv", cmd),
       node: (id, act) => post(`/api/nodes/${encodeURIComponent(id)}/${act}`),
+      addNode: (cfg) => post("/api/nodes", cfg),
+      updateNode: (id, cfg) => post(`/api/nodes/${encodeURIComponent(id)}/config`, cfg, "PUT"),
+      removeNode: (id) => post(`/api/nodes/${encodeURIComponent(id)}`, null, "DELETE"),
       subscribe({ state, log, link }) {
         link("", "CONNECTING");
         const es = new EventSource("/events");
@@ -335,6 +524,42 @@
             emit("node", `${id} started`);
           }
         }
+        tick();
+        return { ok: true };
+      },
+      async addNode(cfg) {
+        await delay(400);
+        nodes.push({ id: cfg.id, addr: cfg.clientAddr, up: true, role: "follower", term: 0, leader: "", timer: 3 });
+        emit("node", `${cfg.id} joined the cluster at ${cfg.clientAddr}`);
+        tick();
+        return { ok: true };
+      },
+      async updateNode(id, cfg) {
+        await delay(300);
+        const n = byId(id);
+        if (!n) return { ok: false, error: `${id} no longer exists` };
+        const wasUp = n.up;
+        if (wasUp) { n.up = false; if (n.role === "leader") for (const m of nodes) m.leader = ""; n.role = "follower"; }
+        n.addr = cfg.clientAddr;
+        emit("node", `${id} settings saved (client ${cfg.clientAddr}, replication ${cfg.replAddr})`);
+        tick();
+        if (wasUp) {
+          await delay(600);
+          n.up = true; n.timer = 3;
+          emit("node", `${id} restarted with new settings`);
+          tick();
+        }
+        return { ok: true };
+      },
+      async removeNode(id) {
+        await delay(300);
+        if (nodes.length <= 1) return { ok: false, error: "the cluster needs at least one node" };
+        const i = nodes.findIndex((n) => n.id === id);
+        if (i < 0) return { ok: false, error: `${id} no longer exists` };
+        const [gone] = nodes.splice(i, 1);
+        if (gone.role === "leader") for (const m of nodes) { m.leader = ""; }
+        if (connected === id) connected = (nodes.find((n) => n.up) || nodes[0]).id;
+        emit("node", `${id} removed from the cluster`);
         tick();
         return { ok: true };
       },

@@ -15,6 +15,10 @@
     <div class="eyebrow">RAFT REPLICATED KEY/VALUE STORE · 分散キーバリューストア</div>
     <h1>CLUSTER <span>MONITOR</span></h1>
   </div>
+  <nav class="tools" aria-label="Cluster tools">
+    <button type="button" class="btn tool-btn" data-open="compare-dlg">COMPARE LOGS</button>
+    <button type="button" class="btn tool-btn" data-open="test-dlg">TEST</button>
+  </nav>
   <dl class="summary">
     <div><dt>LINK</dt><dd id="link-state" class="pill">—</dd></div>
     <div><dt>TERM</dt><dd id="sum-term">—</dd></div>
@@ -28,7 +32,16 @@
 
 <main>
   <section class="nodes-section">
-    <h2 class="sect"><span class="sect-no">01</span>NODES <small>ノード状態</small></h2>
+    <div class="sect-row">
+      <h2 class="sect"><span class="sect-no">01</span>NODES <small>ノード状態</small></h2>
+      <button type="button" id="add-slot" class="add-slot" title="Join a new peer to the cluster">
+        <svg viewBox="0 0 38 42" width="15" height="17" aria-hidden="true">
+          <polygon points="19,2 36,11.5 36,30.5 19,40 2,30.5 2,11.5" fill="none" stroke="currentColor" stroke-width="3.5" stroke-dasharray="6 4"/>
+          <path d="M19 12v18M10 21h18" stroke="currentColor" stroke-width="4.5"/>
+        </svg>
+        ADD NODE
+      </button>
+    </div>
     <div id="nodes" class="nodes"></div>
   </section>
 
@@ -72,6 +85,95 @@
   <span>polled every 1s · pushed over SSE</span>
 </footer>
 
+<dialog id="compare-dlg" class="modal" aria-labelledby="compare-title">
+  <header class="modal-head">
+    <h2 id="compare-title"><span class="sect-no">A</span>COMPARE LOGS <small>ログ比較</small></h2>
+    <button type="button" class="modal-x" data-close aria-label="Close">×</button>
+  </header>
+  <div class="modal-body">
+    <div id="cmp-verdict" class="verdict pending">NOT RUN</div>
+    <p class="modal-note">Checks every node that is up and reports whether their Raft logs match.</p>
+    <table class="cmp-table">
+      <thead><tr><th>NODE</th><th>STATUS</th><th>TERM</th><th>LAST INDEX</th><th>COMMIT</th><th>MATCH</th></tr></thead>
+      <tbody id="cmp-rows"><tr><td colspan="6" class="cmp-empty">no nodes</td></tr></tbody>
+    </table>
+  </div>
+  <footer class="modal-foot">
+    <button type="button" class="btn" data-close>CLOSE</button>
+    <button type="button" id="cmp-run" class="btn btn-exec">RUN COMPARE</button>
+  </footer>
+</dialog>
+
+<dialog id="test-dlg" class="modal" aria-labelledby="test-title">
+  <header class="modal-head">
+    <h2 id="test-title"><span class="sect-no">B</span>TEST <small>試験</small></h2>
+    <button type="button" class="modal-x" data-close aria-label="Close">×</button>
+  </header>
+  <div class="modal-body">
+    <ul class="suites" id="suites">
+      <li><label><input type="checkbox" value="singlebench" checked> <b>SINGLE BENCH</b> <code>test/singlebench</code></label><span class="suite-st">IDLE</span></li>
+      <li><label><input type="checkbox" value="multi/correctness"> <b>CORRECTNESS</b> <code>test/multi/correctness</code></label><span class="suite-st">IDLE</span></li>
+      <li><label><input type="checkbox" value="multi/fail_recover"> <b>FAIL &amp; RECOVER</b> <code>test/multi/fail_recover</code></label><span class="suite-st">IDLE</span></li>
+      <li><label><input type="checkbox" value="multi/fault-tolerance"> <b>FAULT TOLERANCE</b> <code>test/multi/fault-tolerance</code></label><span class="suite-st">IDLE</span></li>
+      <li><label><input type="checkbox" value="multi/perf"> <b>PERF</b> <code>test/multi/perf</code></label><span class="suite-st">IDLE</span></li>
+    </ul>
+    <pre id="test-out" class="test-out" aria-live="polite">select suites and press RUN</pre>
+  </div>
+  <footer class="modal-foot">
+    <button type="button" class="btn" data-close>CLOSE</button>
+    <button type="button" id="test-run" class="btn btn-exec">RUN SELECTED</button>
+  </footer>
+</dialog>
+
+<dialog id="node-dlg" class="modal modal-narrow" aria-labelledby="node-title">
+  <form id="node-form" method="dialog" novalidate>
+    <header class="modal-head">
+      <h2 id="node-title"><span class="hex-mini" id="node-dlg-badge">+</span><span id="node-dlg-heading">ADD NODE</span> <small id="node-dlg-sub">ノード追加</small></h2>
+      <button type="button" class="modal-x" data-close aria-label="Close">×</button>
+    </header>
+    <div class="modal-body">
+      <div class="field-grid">
+        <label class="field">
+          <span class="f-label">NODE ID</span>
+          <input name="id" required pattern="[A-Za-z0-9_\-]{1,16}" spellcheck="false" placeholder="n4">
+          <span class="f-help">Unique name for this node. Can't be changed later.</span>
+        </label>
+        <label class="field">
+          <span class="f-label">WAL PATH</span>
+          <input name="wal" spellcheck="false" placeholder="data/n4.wal">
+          <span class="f-help">Where this node keeps its log on disk.</span>
+        </label>
+        <label class="field">
+          <span class="f-label">CLIENT ADDRESS</span>
+          <input name="clientAddr" required spellcheck="false" placeholder="127.0.0.1:9030">
+          <span class="f-help">Clients and the console connect here.</span>
+        </label>
+        <label class="field">
+          <span class="f-label">REPLICATION ADDRESS</span>
+          <input name="replAddr" required spellcheck="false" placeholder="127.0.0.1:9031">
+          <span class="f-help">Other nodes send Raft traffic here.</span>
+        </label>
+        <label class="field">
+          <span class="f-label">PPROF ADDRESS <em>optional</em></span>
+          <input name="pprofAddr" spellcheck="false" placeholder="127.0.0.1:6060">
+          <span class="f-help">Leave empty to turn profiling off.</span>
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="verbose">
+          <span><span class="f-label">VERBOSE LOGGING</span><span class="f-help">Print server logs to the event log.</span></span>
+        </label>
+      </div>
+      <p class="form-note" id="node-dlg-note"></p>
+      <p class="form-error" id="node-dlg-error" role="alert"></p>
+    </div>
+    <footer class="modal-foot">
+      <button type="button" class="btn btn-danger btn-remove" id="node-remove">REMOVE NODE</button>
+      <button type="button" class="btn" data-close>CANCEL</button>
+      <button type="submit" class="btn btn-exec" id="node-submit">ADD NODE</button>
+    </footer>
+  </form>
+</dialog>
+
 <template id="node-tpl">
   <article class="node">
     <div class="node-head">
@@ -81,6 +183,9 @@
         <div class="node-role"></div>
       </div>
       <div class="conn-tag" title="Console commands are sent to this node">CONNECTED</div>
+      <button type="button" class="node-cfg" data-cfg title="Edit connection settings" aria-label="Edit connection settings">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M3 6h11v2H3zm15 0h3v2h-3zm-2-2h2v6h-2zM3 16h3v2H3zm7 0h11v2H10zm-2-2h2v6H8z"/></svg>
+      </button>
     </div>
     <dl class="node-stats">
       <div><dt>TERM</dt><dd class="v-term"></dd></div>

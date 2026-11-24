@@ -1,0 +1,84 @@
+name: release
+
+# Manual only: Actions tab -> "release" -> Run workflow.
+# Only people with write access to the repo can trigger workflow_dispatch.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to create, e.g. v0.1.0"
+        required: true
+        type: string
+
+# Nothing is granted by default; the job below asks for exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Releases only come from the default branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the tag + GitHub release
+      id-token: write      # sign the build provenance attestation
+      attestations: write  # store the attestation
+    env:
+      # Inputs are passed through env, never interpolated into scripts (prevents injection).
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Validate version
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::version must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          if gh api "repos/$REPO/git/ref/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag $VERSION already exists"
+            exit 1
+          fi
+
+      # Third-party code is pinned to full commit SHAs, not movable tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false # no shared cache in a release job (avoids cache poisoning)
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            name="kvstore-${os}-${arch}"
+            mkdir -p "build/${name}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" -o "build/${name}/kvstore" ./cmd/server
+            tar -C "build/${name}" --owner=0 --group=0 --numeric-owner \
+              -czf "dist/${name}.tar.gz" kvstore
+          done
+          (cd dist && sha256sum *.tar.gz > checksums.txt)
+          cat dist/checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create release
+        run: |
+          gh release create "$VERSION" dist/* \
+            --repo "$REPO" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes
