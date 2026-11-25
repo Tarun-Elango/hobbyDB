@@ -1,17 +1,30 @@
 # Correctness, 5-node cluster
 
-2026-11-18 · darwin/arm64 · 5 `cmd/server` processes on localhost · crashes = SIGKILL · stall = SIGSTOP/SIGCONT
+2026-11-25 17:32 · darwin/arm64, 10 CPUs, go1.27.3 · 5 `cmd/server` processes on localhost · crashes = SIGKILL · stall = SIGSTOP/SIGCONT
 
-```bash
-KV_BENCH=1 go test -v -count=1 ./test/multi/correctness/
-```
+## Linearizability under leader crashes
 
-## Results
+6 clients doing random GET/SET on 4 hot keys for 6s while the leader is SIGKILLed and restarted twice. `read.from=leader` must be linearizable; `read.from=any` is expected to serve stale follower reads.
 
-| check | `read.from=leader` | `read.from=any` |
-|---|---|---|
-| Linearizable under 2 leader crashes (6 clients, 4 hot keys, ~600 ops) | **PASS** (4/4 keys, 3/3 runs) | not linearizable (4/4 keys, 33 provably stale reads) |
-| No lost acked writes (crash ≤2 nodes, 10–14 faults, then whole-cluster crash + restart from WAL) | **PASS** (0 of ~300 lost, 5/5 replicas converge, 3/3 runs) | same |
-| Read-your-writes (ack on leader, then GET on each follower) | 0 / 400 stale | 41 / 400 stale (10%) |
-| Monotonic reads (random node per read, value keeps rising) | 0 went backwards | 2155 / 7811 went backwards (28%) |
-| Stalled old leader (SIGSTOP, new leader commits `new`, GET on old leader, SIGCONT) | **FAIL**: returns `old` (3/3 runs) | returns `old` |
+| read.from | ops | linearizable keys | provably stale reads | result |
+|---|---|---|---|---|
+| leader | 982 | 4/4 | 0 | PASS |
+| any | 1103 | 0/4 | 38 | expected stale |
+
+## No lost acked writes
+
+8 writers for 6s under random node crashes (<=2 down at once), followed by a full-cluster SIGKILL and cold restart from WALs.
+
+| acked | unknown | faults | restart -> leader | lost | converged | result |
+|---|---|---|---|---|---|---|
+| 935 | 0 | 9 | 240ms | 0 | 5/5 | PASS |
+
+## Stale reads
+
+Read-your-writes (100 leader SETs then GET on each follower), monotonic reads (random node GETs over 3s), and stalled old leader (SIGSTOP, new leader commits `new`, GET on old leader, SIGCONT).
+
+| read.from | read-your-writes stale | monotonic backwards | paused old leader GET | result |
+|---|---|---|---|---|
+| leader | 0/400 (0%) | 0/5189 | NotLeader | ryw:PASS / mono:PASS / paused:PASS |
+| any | 72/400 (18%) | 495/1598 | old | ryw:info / mono:info / paused:info |
+

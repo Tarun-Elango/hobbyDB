@@ -1,3 +1,12 @@
+// What this file checks:
+// - Leader election time after killing the leader (5 rounds, no load)
+// - Follower rejoin and catch-up after downtime (both with WAL intact and with wiped disk)
+// - Full-cluster crash mid-load and restart from WALs with zero lost acked writes
+// - Network partition isolating the old leader in a minority (2|3): old leader can't commit, majority elects a new leader, and all nodes converge after heal
+// - Symmetric network partition (2|3) with leader in the majority: writes continue during partition and all nodes converge after heal
+// - Flapping network partitions under load: cluster keeps accepting writes and converges with no data loss
+// - Rolling restart (followers first, leader last) under load with minimal write gap and no data loss
+
 package failrecover
 
 import (

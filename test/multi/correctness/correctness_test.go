@@ -1,3 +1,8 @@
+// What this file checks:
+// - Linearizability under leader crashes (read.from=leader must be linearizable; read.from=any reports stale reads)
+// - No lost acked writes under random node crashes and a full-cluster crash/restart, plus full replica convergence
+// - Stale reads: read-your-writes, monotonic reads, and paused old leader after a new leader commits
+
 package correctness
 
 import (

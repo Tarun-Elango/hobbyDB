@@ -1,6 +1,6 @@
 # Failure and recovery, 5-node cluster
 
-2026-11-19 21:16 · darwin/arm64, 10 CPUs, go1.27.3 · localhost · crash = SIGKILL · partition = test proxy black-holes peer links
+2026-11-25 17:34 · darwin/arm64, 10 CPUs, go1.27.3 · localhost · crash = SIGKILL · partition = test proxy black-holes peer links
 
 `lost` = acked writes missing on any node after recovery (must be 0). `converge` = time until every node holds the same key count.
 
@@ -10,7 +10,7 @@ Leader SIGKILLed 5 times, no load. Time = kill -> first acked write on the new l
 
 | rounds | min ms | median ms | max ms | result |
 |---|---|---|---|---|
-| 5 | 216 | 227 | 489 | PASS |
+| 5 | 208 | 257 | 279 | PASS |
 
 ## Follower rejoin and catch-up
 
@@ -18,8 +18,8 @@ Follower SIGKILLed, cluster takes 3 s of writes, follower restarts. `catch-up` =
 
 | case | keys missed while down | total keys | catch-up ms | lost | result |
 |---|---|---|---|---|---|
-| WAL intact | 175 | 334 | 1949 | 0 | PASS |
-| disk wiped | 180 | 327 | 2001 | 0 | PASS |
+| WAL intact | 526 | 721 | 59.4 | 0 | PASS |
+| disk wiped | 472 | 639 | 126 | 0 | PASS |
 
 ## Full-cluster crash and restart
 
@@ -27,7 +27,7 @@ Follower SIGKILLed, cluster takes 3 s of writes, follower restarts. `catch-up` =
 
 | acked before crash | restart -> leader ms | then converge ms | lost | result |
 |---|---|---|---|---|
-| 147 | 605 | 93.1 | 0 | PASS |
+| 349 | 325 | 12.2 | 0 | PASS |
 
 ## Partition: old leader in the minority (2 | 3)
 
@@ -35,7 +35,7 @@ q=v1 committed, then {leader, 1 follower} cut off from the other 3. SET q=v2 sen
 
 | majority elects ms | q=v3 on new leader | q=v2 on old leader | read q on old leader (cut off) | heal -> old leader has v3 ms | q on all nodes after | result |
 |---|---|---|---|---|---|---|
-| 185 | OK | Error after 5001 ms | v1 | 109 | v3 v3 v3 v3 v3 | PASS |
+| 237 | OK | Error after 5002 ms | v1 | 34.7 | v3 v3 v3 v3 v3 | PASS |
 
 ## Partition: symmetric 2 | 3 (leader in the majority)
 
@@ -43,7 +43,7 @@ q=v1 committed, then {leader, 1 follower} cut off from the other 3. SET q=v2 sen
 
 | writes/s before | during | after heal | max gap during ms | max gap after heal ms | leader changed | client errors | converge ms | lost | result |
 |---|---|---|---|---|---|---|---|---|---|
-| 68 | 91 | 41 | 55.9 | 341 | no | 0 | 1734 | 0 | PASS |
+| 146 | 154 | 169 | 61.9 | 320 | yes | 0 | 138 | 0 | PASS |
 
 ## Flapping links
 
@@ -51,7 +51,7 @@ q=v1 committed, then {leader, 1 follower} cut off from the other 3. SET q=v2 sen
 
 | flaps | writes/s before | while flapping | after | max gap ms | client errors | converge ms | lost | result |
 |---|---|---|---|---|---|---|---|---|
-| 10 | 66 | 29 | 24 | 671 | 0 | 429 | 0 | PASS |
+| 10 | 160 | 45 | 115 | 1414 | 0 | 13.0 | 0 | PASS |
 
 ## Rolling restart
 
@@ -59,4 +59,5 @@ q=v1 committed, then {leader, 1 follower} cut off from the other 3. SET q=v2 sen
 
 | writes/s before | during roll | max gap ms | client errors | converge ms | lost | result |
 |---|---|---|---|---|---|---|
-| 70 | 39 | 688 | 0 | 57.5 | 0 | PASS |
+| 170 | 154 | 283 | 8 | 12.6 | 0 | PASS |
+

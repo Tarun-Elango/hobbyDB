@@ -1,3 +1,9 @@
+// What this file checks:
+// - Scaling write and read throughput/latency across cluster sizes (1, 3, and 5 nodes)
+// - Mixed read/write workloads (90/10 and 50/50) on a 5-node cluster
+// - Concurrency scaling from 1 to 64 client connections (write-only and read-only) on 5 nodes
+// - Write throughput and latency impact when 0 to 3 followers have added network latency
+
 package perf
 
 import (
