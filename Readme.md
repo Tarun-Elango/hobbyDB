@@ -94,19 +94,41 @@ Raft persistent metadata (term/vote) is stored separately, e.g. `data/node-a.wal
 
 ## Install from a release
 
-`deploy/install.sh` installs a prebuilt server binary from GitHub Releases (Linux or macOS, amd64/arm64):
+The server and the client are installed separately, each with its own script. Both download a prebuilt binary from GitHub Releases (Linux or macOS, amd64/arm64) over HTTPS, verify its SHA-256 checksum, and install to `/usr/local/bin` (using `sudo` only if needed). Override the location with `BIN_DIR=...`.
+
+### Server
 
 ```bash
-./deploy/install.sh          # latest release
-./deploy/install.sh v0.1.0   # specific version
+./deploy/install-server.sh          # latest release
+./deploy/install-server.sh v0.1.0   # specific version
 ```
 
-It downloads the binary for your OS/CPU over HTTPS, verifies its SHA-256 checksum, and installs it to `/usr/local/bin/kestrel` (using `sudo` only if needed). It also creates a WAL directory at `~/.kestrel` (`/var/lib/kestrel` when run as root). It does not start the server; run `kestrel` with your own flags, e.g. `--wal=$HOME/.kestrel/node-a.wal`.
+Installs `kestrel` and creates a WAL directory at `~/.kestrel` (`/var/lib/kestrel` when run as root; override with `DATA_DIR=...`). It does not start the server; run `kestrel` with your own flags, e.g. `--wal=$HOME/.kestrel/node-a.wal`.
 
-To uninstall everything, including WAL data:
+To uninstall, including WAL data:
 
 ```bash
 kestrel-uninstall --purge
 ```
 
 Without `--purge` it removes the binary but keeps the WAL directory.
+
+### Client
+
+```bash
+./deploy/install-client.sh          # latest release
+./deploy/install-client.sh v0.1.0   # specific version
+```
+
+Installs `kestrel-cli`. Connect to a cluster (defaults to `localhost:9000`):
+
+```bash
+kestrel-cli --9000 --9010 --9020
+kestrel-cli --host-a:9000,host-b:9000,host-c:9000
+```
+
+To uninstall:
+
+```bash
+kestrel-cli-uninstall
+```

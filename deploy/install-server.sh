@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Installs the kestrel server binary (kestrelKV) from a GitHub release (Linux or macOS).
 #
-#   ./install.sh            # latest release
-#   ./install.sh v0.1.0     # specific release
+#   ./install-server.sh            # latest release
+#   ./install-server.sh v0.1.0     # specific release
 #
 # Installs:
 #   /usr/local/bin/kestrel            the server binary (uses sudo only if needed)
@@ -10,7 +10,7 @@
 #   ~/.kestrel                        data dir for the WAL (/var/lib/kestrel when run as root)
 #
 # Override locations with BIN_DIR=... and DATA_DIR=... env vars.
-# It does not start the server.
+# It does not start the server. The client is installed separately with install-client.sh.
 set -euo pipefail
 
 REPO="Tarun-Elango/kestrelKV"
@@ -90,7 +90,7 @@ chmod 0700 "$DATA_DIR"
 
 cat > "$TMP/kestrel-uninstall" <<EOF
 #!/usr/bin/env bash
-# Removes what install.sh added. Keeps WAL data unless --purge is given.
+# Removes what install-server.sh added. Keeps WAL data unless --purge is given.
 #   kestrel-uninstall           # remove binary, keep $DATA_DIR
 #   kestrel-uninstall --purge   # also delete $DATA_DIR
 set -euo pipefail
@@ -124,4 +124,6 @@ Start it with your flags, for example:
 
 Uninstall:  kestrel-uninstall          (keeps WAL data)
             kestrel-uninstall --purge  (deletes WAL data too)
+
+To talk to the cluster, install the client with install-client.sh.
 EOF

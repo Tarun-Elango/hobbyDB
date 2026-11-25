@@ -246,9 +246,10 @@
 
       <div class="card">
         <h2>Quick install</h2>
-        <p class="note">Install a prebuilt server binary from GitHub Releases, run the following from the repo:</p>
-        <pre><code>./deploy/install.sh</code></pre>
-        <p class="note">This installs <code>kestrel</code> to <code>/usr/local/bin</code> and creates a WAL directory at <code>~/.kestrel</code>. <a href="#/docs/install">More install options</a></p>
+        <p class="note">Install prebuilt binaries from GitHub Releases. The server and the client are installed separately; run the following from the repo:</p>
+        <pre><code>./deploy/install-server.sh   # server: kestrel
+./deploy/install-client.sh   # client: kestrel-cli</code></pre>
+        <p class="note">Both install to <code>/usr/local/bin</code>; the server script also creates a WAL directory at <code>~/.kestrel</code>. <a href="#/docs/install">More install options</a></p>
       </div>
 
       <div class="card">
@@ -374,14 +375,23 @@ xxd data/node-c.wal | head</code></pre>
 
       <div class="card" id="install">
         <h2>Install from a release</h2>
-        <p class="note"><code>deploy/install.sh</code> installs a prebuilt server binary from GitHub Releases (Linux or macOS, amd64/arm64).</p>
-        <pre><code>./deploy/install.sh          # latest release
-./deploy/install.sh v0.1.0   # specific version</code></pre>
-        <p class="note">It downloads the binary for your OS/CPU over HTTPS, verifies its SHA-256 checksum, and installs it to <code>/usr/local/bin/kestrel</code> (using <code>sudo</code> only if needed). It creates a WAL directory at <code>~/.kestrel</code> (<code>/var/lib/kestrel</code> as root). It does not start the server; run <code>kestrel</code> with your own flags, e.g. <code>--wal=$HOME/.kestrel/node-a.wal</code>.</p>
+        <p class="note">The server and the client are installed separately, each with its own script. Both download a prebuilt binary from GitHub Releases (Linux or macOS, amd64/arm64) over HTTPS, verify its SHA-256 checksum, and install to <code>/usr/local/bin</code> (using <code>sudo</code> only if needed).</p>
 
-        <h3>Uninstall</h3>
+        <h3>Server</h3>
+        <pre><code>./deploy/install-server.sh          # latest release
+./deploy/install-server.sh v0.1.0   # specific version</code></pre>
+        <p class="note">Installs <code>kestrel</code> and creates a WAL directory at <code>~/.kestrel</code> (<code>/var/lib/kestrel</code> as root). It does not start the server; run <code>kestrel</code> with your own flags, e.g. <code>--wal=$HOME/.kestrel/node-a.wal</code>.</p>
         <pre><code>kestrel-uninstall --purge</code></pre>
-        <p class="note">Without <code>--purge</code> it removes the binary but keeps the WAL directory.</p>
+        <p class="note">Uninstalls the server. Without <code>--purge</code> it removes the binary but keeps the WAL directory.</p>
+
+        <h3>Client</h3>
+        <pre><code>./deploy/install-client.sh          # latest release
+./deploy/install-client.sh v0.1.0   # specific version</code></pre>
+        <p class="note">Installs <code>kestrel-cli</code>. Connect to a cluster (defaults to <code>localhost:9000</code>):</p>
+        <pre><code>kestrel-cli --9000 --9010 --9020
+kestrel-cli --host-a:9000,host-b:9000,host-c:9000</code></pre>
+        <pre><code>kestrel-cli-uninstall</code></pre>
+        <p class="note">Uninstalls the client.</p>
       </div>
 
       <p class="go-top"><a href="#/docs" onclick="window.scrollTo(0, 0)">↑ Back to top</a></p>
