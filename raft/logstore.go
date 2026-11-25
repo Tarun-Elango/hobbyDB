@@ -92,6 +92,32 @@ func (n *Node) persistAppendLocked(entry LogEntry) error {
 	})
 }
 
+// persistAppendBatchLocked makes all entries durable in a single WAL write and
+// fsync. Call it before the entries are added to the in-memory log or
+// acknowledged to anyone.
+func (n *Node) persistAppendBatchLocked(entries []LogEntry) error {
+	if n.logWAL == nil || len(entries) == 0 {
+		return nil
+	}
+	recs := make([]wal.Record, len(entries))
+	for i, entry := range entries {
+		op, err := walOp(entry.Command.Op)
+		if err != nil {
+			return err
+		}
+		recs[i] = wal.Record{
+			Index:    entry.Index,
+			Term:     entry.Term,
+			Op:       op,
+			Key:      entry.Command.Key,
+			Value:    entry.Command.Value,
+			ClientID: entry.Command.ClientID,
+			Seq:      entry.Command.Seq,
+		}
+	}
+	return n.logWAL.AppendBatch(recs)
+}
+
 // persistTruncateLocked drops entry index and everything after it from disk.
 func (n *Node) persistTruncateLocked(index uint64) error {
 	if n.logWAL == nil {

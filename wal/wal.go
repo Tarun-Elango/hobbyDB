@@ -82,17 +82,39 @@ func Open(path string) (*Log, error) {
 // append
 // caller to not treat command as durable until return err
 func (l *Log) Append(rec Record) error {
+	return l.AppendBatch([]Record{rec})
+}
+
+// AppendBatch writes all records to the WAL in a single write and fsyncs once
+// for the entire batch. If any record fails validation or encoding, nothing is
+// written to the file.
+func (l *Log) AppendBatch(recs []Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
 	l.muWal.Lock()
 	defer l.muWal.Unlock()
 
-	if err := EncodeRecord(l.file, rec); err != nil {
+	var buf bytes.Buffer
+	for _, rec := range recs {
+		if err := EncodeRecord(&buf, rec); err != nil {
+			return fmt.Errorf("Failed to append: %w", err)
+		}
+	}
+
+	n, err := l.file.Write(buf.Bytes())
+	if err != nil {
 		return fmt.Errorf("Failed to append: %w", err)
+	}
+	if n != buf.Len() {
+		return fmt.Errorf("Failed to append: %w", io.ErrShortWrite)
 	}
 	if err := l.file.Sync(); err != nil {
 		return fmt.Errorf("failed to sync WAL: %w", err)
 	}
 
-	l.lastIndex = rec.Index
+	l.lastIndex = recs[len(recs)-1].Index
 	return nil
 }
 
