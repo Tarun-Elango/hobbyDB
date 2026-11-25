@@ -1,3 +1,7 @@
+// What this file checks:
+// - Sanity-checks the linearizability checker (valid, stale, concurrent, flip-back, and unknown-write histories)
+// - Sanity-checks stale-read counting on a known stale history
+
 package correctness
 
 import (

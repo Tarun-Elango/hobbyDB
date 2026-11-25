@@ -1,3 +1,8 @@
+// What this file checks:
+// - Writes still commit with 0, 1, or 2 followers down (leader alive, quorum intact)
+// - Mid-load failover when the leader (or leader + 1 follower) is killed, measuring failover gap with no lost writes
+// - Quorum loss (3 of 5 nodes down): no writes are acked, survivors can still serve local reads, and restarting 1 node restores writes
+
 package faulttolerance
 
 import (

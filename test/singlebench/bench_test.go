@@ -1,3 +1,9 @@
+// What this file checks:
+// - Single-node startup time and memory (RSS) across WAL sizes (0, 100k, 1M records)
+// - Write throughput and latency (95% SET / 5% DEL) across connection counts and value sizes
+// - Read throughput and latency under concurrent write load (0, 1, and 16 writer connections)
+// - Mixed closed-loop workloads (95/5 and 50/50 read/write) on 32 connections
+
 package single
 
 import (

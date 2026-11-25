@@ -132,3 +132,18 @@ To uninstall:
 ```bash
 kestrel-cli-uninstall
 ```
+
+## Run all tests
+
+Run all integration, correctness, fault-tolerance, and benchmark suites under `test/` from the repo root:
+
+```bash
+KV_BENCH=1 go test -v -count=1 -p 1 -timeout 30m ./test/...
+```
+
+- `KV_BENCH=1` — enables the slow cluster and benchmark tests (skipped by default) and updates each suite's `results.md`.
+- `-v` — prints verbose output as each test runs.
+- `-count=1` — disables Go's test cache so every test runs fresh.
+- `-p 1` — runs one package at a time so cluster and perf suites don't compete for CPU/disk and skew results.
+- `-timeout 30m` — raises Go's default 10-minute per-package timeout for longer suites.
+- `./test/...` — runs every test package under `test/` (use `./test/multi/...` for multi-node suites only).
