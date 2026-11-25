@@ -6,18 +6,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"kvStore/config"
 	"kvStore/logx"
 	"kvStore/raft"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
-	rpcAttemptTimeout = config.Duration("replication.rpc.attempt.timeout.ms")
-	rpcAttempts       = config.Int("replication.rpc.attempts")
+	rpcAttemptTimeout       = config.Duration("replication.rpc.attempt.timeout.ms")
+	rpcAttempts             = config.Int("replication.rpc.attempts")
+	heartbeatAttemptTimeout = config.Duration("replication.heartbeat.attempt.timeout.ms")
+	heartbeatAttempts       = config.Int("replication.heartbeat.attempts")
+	appendAttemptTimeout    = config.Duration("replication.append.attempt.timeout.ms")
 )
+
+const (
+	rpcRetryPause       = 20 * time.Millisecond
+	heartbeatRetryPause = 5 * time.Millisecond
+)
+
+var errPeerClientClosed = errors.New("replication: peer client is closed")
 
 type TCPPeerClient struct {
 	addr string
@@ -51,7 +63,7 @@ func (c *TCPPeerClient) roundTrip(
 	defer c.mu.Unlock()
 
 	if c.closed {
-		return errors.New("replication: peer client is closed")
+		return errPeerClientClosed
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -73,7 +85,11 @@ func (c *TCPPeerClient) roundTrip(
 	stopCancelWatcher := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
-	defer stopCancelWatcher()
+	defer func() {
+		if !stopCancelWatcher() {
+			c.invalidateLocked(conn)
+		}
+	}()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
@@ -135,10 +151,34 @@ func (c *TCPPeerClient) Close() error {
 	return err
 }
 
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isStaleConnError(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
 func (c *TCPPeerClient) RequestVote(
 	ctx context.Context,
 	args raft.RequestVoteArgs,
 ) (raft.RequestVoteResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var last error
 	for attempts := 0; attempts < rpcAttempts; attempts++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
@@ -162,10 +202,17 @@ func (c *TCPPeerClient) RequestVote(
 			return res, nil
 		}
 		last = err
+		if errors.Is(err, errPeerClientClosed) {
+			return raft.RequestVoteResult{}, err
+		}
 		if ctx.Err() != nil {
 			return raft.RequestVoteResult{}, ctx.Err()
 		}
-		time.Sleep(20 * time.Millisecond)
+		if attempts+1 < rpcAttempts {
+			if err := sleepWithContext(ctx, rpcRetryPause); err != nil {
+				return raft.RequestVoteResult{}, err
+			}
+		}
 	}
 	return raft.RequestVoteResult{}, last
 }
@@ -174,9 +221,12 @@ func (c *TCPPeerClient) Heartbeat(
 	ctx context.Context,
 	args raft.HeartbeatArgs,
 ) (raft.HeartbeatResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var last error
-	for attempts := 0; attempts < rpcAttempts; attempts++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+	for attempts := 0; attempts < heartbeatAttempts; attempts++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, heartbeatAttemptTimeout)
 		var res raft.HeartbeatResult
 		err := c.roundTrip(attemptCtx,
 			func(conn net.Conn) error { return EncodeHeartbeat(conn, args) },
@@ -198,10 +248,17 @@ func (c *TCPPeerClient) Heartbeat(
 			return res, nil
 		}
 		last = err
+		if errors.Is(err, errPeerClientClosed) {
+			return raft.HeartbeatResult{}, err
+		}
 		if ctx.Err() != nil {
 			return raft.HeartbeatResult{}, ctx.Err()
 		}
-		time.Sleep(20 * time.Millisecond)
+		if attempts+1 < heartbeatAttempts && !isStaleConnError(err) {
+			if err := sleepWithContext(ctx, heartbeatRetryPause); err != nil {
+				return raft.HeartbeatResult{}, err
+			}
+		}
 	}
 	return raft.HeartbeatResult{}, last
 }
@@ -211,9 +268,12 @@ func (c *TCPPeerClient) AppendEntries(
 	ctx context.Context,
 	args raft.AppendEntriesArgs,
 ) (raft.AppendEntriesResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var last error
 	for attempts := 0; attempts < rpcAttempts; attempts++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, appendAttemptTimeout)
 		var res raft.AppendEntriesResult
 		err := c.roundTrip(attemptCtx,
 			func(conn net.Conn) error { return EncodeRaftAppendEntries(conn, args) },
@@ -234,10 +294,17 @@ func (c *TCPPeerClient) AppendEntries(
 			return res, nil
 		}
 		last = err
+		if errors.Is(err, errPeerClientClosed) {
+			return raft.AppendEntriesResult{}, err
+		}
 		if ctx.Err() != nil {
 			return raft.AppendEntriesResult{}, ctx.Err()
 		}
-		time.Sleep(20 * time.Millisecond)
+		if attempts+1 < rpcAttempts {
+			if err := sleepWithContext(ctx, rpcRetryPause); err != nil {
+				return raft.AppendEntriesResult{}, err
+			}
+		}
 	}
 	return raft.AppendEntriesResult{}, last
 }
@@ -473,7 +540,7 @@ func serveReplicationConnection(
 			}
 			_ = raftNode.ObserverLeader(args.Term, args.LeaderID)
 			if err := EncodeHeartbeatResult(conn, raft.HeartbeatResult{
-				Term: raftNode.Snapshot().CurrentTerm,
+				Term: raftNode.Status().CurrentTerm,
 			}); err != nil {
 				return
 			}
