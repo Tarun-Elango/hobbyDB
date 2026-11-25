@@ -342,7 +342,7 @@ func (n *Node) advanceCommitLocked() {
 			continue
 		}
 		if n.copiesAtLocked(entry.Index) >= n.quorumLocked() {
-			n.CommitIndex = entry.Index
+			n.setCommitLocked(entry.Index, entry.Term)
 			if n.CommitIndex > prev {
 				n.applyCond.Broadcast()
 				// tell followers the new commit index even if they have no new entries
@@ -393,6 +393,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 	wasLeader := n.Role == Leader
 	n.setMetaLocked(Follower, args.LeaderID)
 	if wasLeader {
+		n.cancelReadRound()
 		n.applyCond.Broadcast()
 		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
 	}
@@ -452,7 +453,8 @@ func (n *Node) advanceFollowerCommitLocked(leaderCommit, matchedThrough uint64) 
 		commit = matchedThrough
 	}
 	if commit > n.CommitIndex {
-		n.CommitIndex = commit
+		commitTerm, _ := n.logTermAtLocked(commit)
+		n.setCommitLocked(commit, commitTerm)
 		n.applyCond.Broadcast()
 	}
 }

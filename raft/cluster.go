@@ -21,8 +21,11 @@ func (n *Node) SetPeers(peerIds []string) error {
 		wakes[id] = make(chan struct{}, 1)
 	}
 
+	peersCopy := append([]string(nil), peerIds...)
 	n.mu.Lock()
-	n.peers = append([]string(nil), peerIds...)
+	n.metaMu.Lock()
+	n.peers = peersCopy
+	n.metaMu.Unlock()
 	n.peerWake = wakes
 	n.mu.Unlock()
 	return nil
