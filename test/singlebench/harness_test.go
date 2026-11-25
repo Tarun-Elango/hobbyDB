@@ -6,7 +6,7 @@
 // commit -> apply -> response.
 //
 // They are slow, so they only run when KV_BENCH=1. Each run overwrites
-// result.md with a summary table plus one table per test.
+// results.md with a summary table plus one table per test.
 package single
 
 import (
@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-const resultFile = "result.md"
+const resultFile = "results.md"
 
 var (
 	serverBin string
@@ -550,7 +550,7 @@ var (
 	headlines []headline
 )
 
-// record adds a row to a named table; tables are written to result.md at the end.
+// record adds a row to a named table; tables are written to results.md at the end.
 func record(title, note string, header []string, row []string) {
 	reportMu.Lock()
 	defer reportMu.Unlock()
@@ -579,7 +579,7 @@ func writeTable(b *strings.Builder, header []string, rows [][]string) {
 	b.WriteString("\n")
 }
 
-// writeReport overwrites result.md with this run (git history keeps old runs)
+// writeReport overwrites results.md with this run (git history keeps old runs)
 // and prints the summary to stdout.
 func writeReport() {
 	reportMu.Lock()

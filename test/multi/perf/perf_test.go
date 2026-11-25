@@ -74,7 +74,7 @@ func TestSlowFollower(t *testing.T) {
 	for _, slow := range []int{0, 1, 2, 3} {
 		ld := c.leader(5 * time.Second)
 		fs := c.followers(ld)
-		c.slowLinks(ld, fs, 0)
+		c.clearSlowLinks()
 		c.slowLinks(ld, fs[:slow], oneWay)
 		time.Sleep(200 * time.Millisecond)
 		s := load(c, conns, 0, workDur())

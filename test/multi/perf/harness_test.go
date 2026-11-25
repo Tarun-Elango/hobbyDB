@@ -2,7 +2,7 @@
 // subprocess per node, its own WAL dir): latency percentiles, scaling with
 // cluster size, mixed workloads, concurrency sweeps, and slow followers.
 //
-// Slow, so only runs with KV_BENCH=1. Each run overwrites result.md's tables.
+// Slow, so only runs with KV_BENCH=1. Each run overwrites results.md's tables.
 package perf
 
 import (
@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	resultFile  = "result.md"
+	resultFile  = "results.md"
 	preloadKeys = 200
 )
 
@@ -264,10 +264,10 @@ func (c *cluster) leader(timeout time.Duration) int {
 // each is acked, then waits until every node has applied all of them.
 func (c *cluster) preload() {
 	c.t.Helper()
+	ld := c.leader(10 * time.Second)
 	for k := 0; k < preloadKeys; k++ {
 		cmd := proto.Command{Op: proto.OpSet, Key: []byte(fmt.Sprintf("k%d", k)), Value: val128}
 		for deadline := time.Now().Add(10 * time.Second); ; {
-			ld := c.leader(10 * time.Second)
 			resp, err := oneShot(c.nodes[ld].clientAddr, cmd, 5*time.Second)
 			if err == nil && resp.Status == proto.StatusOk {
 				break
@@ -275,6 +275,7 @@ func (c *cluster) preload() {
 			if time.Now().After(deadline) {
 				c.t.Fatalf("preload k%d: %v %v", k, resp.Status, err)
 			}
+			ld = c.leader(10 * time.Second)
 		}
 	}
 	for deadline := time.Now().Add(10 * time.Second); ; {
@@ -398,6 +399,17 @@ func (p *proxy) pipe(dst, src net.Conn) {
 	_ = src.Close()
 }
 
+// clearSlowLinks resets every proxy link delay to 0.
+func (c *cluster) clearSlowLinks() {
+	for _, row := range c.proxies {
+		for _, p := range row {
+			if p != nil {
+				p.setDelay(0)
+			}
+		}
+	}
+}
+
 // slowLinks delays the leader <-> follower links for each listed follower.
 func (c *cluster) slowLinks(leader int, followers []int, oneWay time.Duration) {
 	for _, f := range followers {
@@ -467,10 +479,11 @@ func load(c *cluster, conns int, readFrac float64, dur time.Duration) stats {
 	ld := c.leader(5 * time.Second)
 	var (
 		mu  sync.Mutex
-		out = stats{dur: dur, errKinds: map[string]int{}}
+		out = stats{errKinds: map[string]int{}}
 		wg  sync.WaitGroup
 	)
-	deadline := time.Now().Add(dur)
+	start := time.Now()
+	deadline := start.Add(dur)
 	for g := 0; g < conns; g++ {
 		wg.Add(1)
 		go func(g int) {
@@ -560,6 +573,7 @@ func load(c *cluster, conns int, readFrac float64, dur time.Duration) stats {
 		}(g)
 	}
 	wg.Wait()
+	out.dur = time.Since(start)
 	if out.errs > 0 || out.redirects > 0 {
 		c.t.Logf("conns=%d read=%.2f writes=%d errors=%v redirects=%d", conns, readFrac, len(out.writes), out.errKinds, out.redirects)
 	}
@@ -618,7 +632,7 @@ func record(title, note string, header, row []string) {
 }
 
 // writeReport rewrites the generated tables and keeps any hand-written
-// section starting at "## Takeaways" from the previous result.md.
+// section starting at "## Takeaways" from the previous results.md.
 func writeReport() {
 	reportMu.Lock()
 	defer reportMu.Unlock()

@@ -7,7 +7,7 @@
 // the test, so a partition is "the proxy black-holes the link" (bytes go in,
 // nothing comes out, RPCs time out) without touching the OS network.
 //
-// Slow, so only runs with KV_BENCH=1. Each run overwrites result.md.
+// Slow, so only runs with KV_BENCH=1. Each run overwrites results.md.
 package failrecover
 
 import (
@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ import (
 const (
 	clusterSize = 5
 	writerConns = 8
-	resultFile  = "result.md"
+	resultFile  = "results.md"
 )
 
 var (
@@ -521,10 +522,13 @@ type loadResult struct {
 	errs int
 }
 
+var loadBatch atomic.Int64
+
 // writeLoad runs `conns` clients that SET unique keys (value == key) for dur,
 // following NotLeader redirects and moving on when their node is down or cut
 // off. Every acked key is recorded so it can be checked for loss later.
 func writeLoad(c *cluster, conns int, dur time.Duration) loadResult {
+	batch := loadBatch.Add(1)
 	var (
 		mu  sync.Mutex
 		out loadResult
@@ -558,7 +562,7 @@ func writeLoad(c *cluster, conns int, dur time.Duration) loadResult {
 						continue
 					}
 				}
-				key := fmt.Sprintf("w%d-%d", g, seq)
+				key := fmt.Sprintf("b%d-w%d-%d", batch, g, seq)
 				resp, err := cl.do(proto.Command{Op: proto.OpSet, Key: []byte(key), Value: []byte(key)}, 6*time.Second)
 				switch {
 				case err != nil:

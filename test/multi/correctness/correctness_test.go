@@ -27,7 +27,9 @@ func TestLinearizable(t *testing.T) {
 			since := func() int64 { return int64(time.Since(start)) }
 
 			// Faults: kill leader at 1s, restart at 2.5s, kill the new leader at 3.5s, restart at 5s.
+			faultDone := make(chan struct{})
 			go func() {
+				defer close(faultDone)
 				var victims []int
 				for _, at := range []time.Duration{1 * time.Second, 2500 * time.Millisecond, 3500 * time.Millisecond, 5 * time.Second} {
 					time.Sleep(time.Until(start.Add(at)))
@@ -88,6 +90,7 @@ func TestLinearizable(t *testing.T) {
 				}(g)
 			}
 			wg.Wait()
+			<-faultDone
 
 			total, stale, bad := 0, 0, 0
 			for k, ops := range hist {
@@ -101,6 +104,17 @@ func TestLinearizable(t *testing.T) {
 				t.Logf("key k%d: %d ops, %s, %d provably stale reads", k, len(ops), res, s)
 			}
 			t.Logf("SUMMARY mode=%s ops=%d keys_not_linearizable=%d/%d stale_reads=%d", mode, total, bad, nkeys, stale)
+			status := passFail(bad == 0)
+			if mode == "any" {
+				status = "expected stale"
+				if bad == 0 {
+					status = "PASS"
+				}
+			}
+			record("Linearizability under leader crashes",
+				"6 clients doing random GET/SET on 4 hot keys for 6s while the leader is SIGKILLed and restarted twice. `read.from=leader` must be linearizable; `read.from=any` is expected to serve stale follower reads.",
+				[]string{"read.from", "ops", "linearizable keys", "provably stale reads", "result"},
+				[]string{mode, fmt.Sprint(total), fmt.Sprintf("%d/%d", nkeys-bad, nkeys), fmt.Sprint(stale), status})
 			if mode == "leader" && bad > 0 {
 				t.Errorf("read.from=leader produced a non-linearizable history")
 			}
@@ -121,8 +135,10 @@ func TestNoLostAckedWrites(t *testing.T) {
 	start := time.Now()
 
 	stop := make(chan struct{})
+	chaosDone := make(chan struct{})
 	faults := 0
 	go func() { // chaos: every 600 ms kill a live node (if <2 down) or restart a dead one
+		defer close(chaosDone)
 		rng := rand.New(rand.NewSource(42))
 		var down []int
 		for {
@@ -167,6 +183,7 @@ func TestNoLostAckedWrites(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
+	<-chaosDone
 
 	// Full-cluster crash and cold restart from the WALs.
 	c.killAll()
@@ -223,6 +240,13 @@ func TestNoLostAckedWrites(t *testing.T) {
 
 	t.Logf("SUMMARY acked=%d unknown=%d faults=%d full_restart_to_leader=%s lost=%d converged=%d/%d%s",
 		len(acked), unknown, faults, recovery.Round(time.Millisecond), lost, converged, clusterSize, lagging)
+	ok := len(acked) > 0 && lost == 0 && converged == clusterSize
+	record("No lost acked writes",
+		"8 writers for 6s under random node crashes (<=2 down at once), followed by a full-cluster SIGKILL and cold restart from WALs.",
+		[]string{"acked", "unknown", "faults", "restart -> leader", "lost", "converged", "result"},
+		[]string{fmt.Sprint(len(acked)), fmt.Sprint(unknown), fmt.Sprint(faults),
+			recovery.Round(time.Millisecond).String(), fmt.Sprint(lost),
+			fmt.Sprintf("%d/%d", converged, clusterSize), passFail(ok)})
 	if len(acked) == 0 {
 		t.Fatal("no writes acked")
 	}
@@ -278,16 +302,18 @@ func TestStaleReads(t *testing.T) {
 
 			// monotonic reads
 			mkey := []byte("mono")
+			mld := c.leader(5 * time.Second)
 			stopW := make(chan struct{})
+			writerDone := make(chan struct{})
 			go func() {
-				ld := c.leader(5 * time.Second)
+				defer close(writerDone)
 				for i := 1; ; i++ {
 					select {
 					case <-stopW:
 						return
 					default:
 					}
-					c.call(ld, proto.Command{Op: proto.OpSet, Key: mkey, Value: []byte(strconv.Itoa(i))}, 5*time.Second)
+					c.call(mld, proto.Command{Op: proto.OpSet, Key: mkey, Value: []byte(strconv.Itoa(i))}, 5*time.Second)
 				}
 			}()
 			rng := rand.New(rand.NewSource(1))
@@ -307,6 +333,7 @@ func TestStaleReads(t *testing.T) {
 				}
 			}
 			close(stopW)
+			<-writerDone
 			t.Logf("SUMMARY mode=%s monotonic reads: value went backwards %d/%d reads", mode, back, mreads)
 			if mode == "leader" && back > 0 {
 				t.Errorf("read.from=leader: value went backwards %d times", back)
@@ -348,6 +375,23 @@ func TestStaleReads(t *testing.T) {
 			}
 			t.Logf("SUMMARY mode=%s paused old leader %s -> %s, new leader %s committed k=new; GET on old leader returned %q",
 				mode, c.nodes[old].id, "resumed", c.nodes[nl].id, got)
+			pausedOK := got != "old"
+			rywRes := passFail(stale == 0)
+			monoRes := passFail(back == 0)
+			pausedRes := passFail(pausedOK)
+			if mode == "any" {
+				rywRes = "info"
+				monoRes = "info"
+				pausedRes = "info"
+			}
+			record("Stale reads",
+				"Read-your-writes (100 leader SETs then GET on each follower), monotonic reads (random node GETs over 3s), and stalled old leader (SIGSTOP, new leader commits `new`, GET on old leader, SIGCONT).",
+				[]string{"read.from", "read-your-writes stale", "monotonic backwards", "paused old leader GET", "result"},
+				[]string{mode,
+					fmt.Sprintf("%d/%d (%.0f%%)", stale, reads, 100*float64(stale)/float64(reads)),
+					fmt.Sprintf("%d/%d", back, mreads),
+					got,
+					fmt.Sprintf("ryw:%s / mono:%s / paused:%s", rywRes, monoRes, pausedRes)})
 			if mode == "leader" && got == "old" {
 				t.Errorf("read.from=leader: deposed leader served stale value %q (no leadership check before reads)", got)
 			}
