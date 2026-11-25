@@ -11,3 +11,4 @@ and partitions.
 5	etcd head-to-head. Same machine, 3 nodes, 1–256 clients, 128 B / 4 KiB / 64 KiB values. Report writes/s and p50/p99/p999.	This is the result you publish.
 6	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
 7.  check/add settings to tweak consitency / availability, and performance
+8.  update readme and docs

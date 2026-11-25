@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light">
-  <title>hobbyDB</title>
+  <title>kestrelKV</title>
   <style>
     :root {
       /* light vintage web: grey desktop, white page, navy headings */
@@ -218,13 +218,13 @@
     <!-- ===================== ABOUT ===================== -->
     <div class="wrap" id="page-about">
       <div class="page-title">
-        <h1>hobbyDB</h1>
+        <h1>kestrelKV</h1>
         <a href="https://github.com/Tarun-Elango" class="byline">by Tarun-Elango</a>
       </div>
       <p class="tagline">A distributed key-value store in Go — Raft consensus, a durable write-ahead log, and a custom binary TCP protocol for clients and peer replication.</p>
 
       <div class="card card-purpose">
-        <h2>Why hobbyDB?</h2>
+        <h2>Why kestrelKV?</h2>
         <ul>
           <li><strong>Raft consensus</strong> — nodes elect a leader automatically; no node is hand-picked, and a new leader takes over when one dies</li>
           <li><strong>Durable writes</strong> — every command is fsynced to the WAL before it is acknowledged</li>
@@ -248,7 +248,7 @@
         <h2>Quick install</h2>
         <p class="note">Install a prebuilt server binary from GitHub Releases, run the following from the repo:</p>
         <pre><code>./deploy/install.sh</code></pre>
-        <p class="note">This installs <code>kvstore</code> to <code>/usr/local/bin</code> and creates a WAL directory at <code>~/.kvstore</code>. <a href="#/docs/install">More install options</a></p>
+        <p class="note">This installs <code>kestrel</code> to <code>/usr/local/bin</code> and creates a WAL directory at <code>~/.kestrel</code>. <a href="#/docs/install">More install options</a></p>
       </div>
 
       <div class="card">
@@ -377,10 +377,10 @@ xxd data/node-c.wal | head</code></pre>
         <p class="note"><code>deploy/install.sh</code> installs a prebuilt server binary from GitHub Releases (Linux or macOS, amd64/arm64).</p>
         <pre><code>./deploy/install.sh          # latest release
 ./deploy/install.sh v0.1.0   # specific version</code></pre>
-        <p class="note">It downloads the binary for your OS/CPU over HTTPS, verifies its SHA-256 checksum, and installs it to <code>/usr/local/bin/kvstore</code> (using <code>sudo</code> only if needed). It creates a WAL directory at <code>~/.kvstore</code> (<code>/var/lib/kvstore</code> as root). It does not start the server; run <code>kvstore</code> with your own flags, e.g. <code>--wal=$HOME/.kvstore/node-a.wal</code>.</p>
+        <p class="note">It downloads the binary for your OS/CPU over HTTPS, verifies its SHA-256 checksum, and installs it to <code>/usr/local/bin/kestrel</code> (using <code>sudo</code> only if needed). It creates a WAL directory at <code>~/.kestrel</code> (<code>/var/lib/kestrel</code> as root). It does not start the server; run <code>kestrel</code> with your own flags, e.g. <code>--wal=$HOME/.kestrel/node-a.wal</code>.</p>
 
         <h3>Uninstall</h3>
-        <pre><code>kvstore-uninstall --purge</code></pre>
+        <pre><code>kestrel-uninstall --purge</code></pre>
         <p class="note">Without <code>--purge</code> it removes the binary but keeps the WAL directory.</p>
       </div>
 
@@ -401,7 +401,7 @@ xxd data/node-c.wal | head</code></pre>
         a.classList.toggle('active', on);
         if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
       });
-      document.title = page === 'docs' ? 'hobbyDB · Docs' : 'hobbyDB';
+      document.title = page === 'docs' ? 'kestrelKV · Docs' : 'kestrelKV';
       var target = parts[1] && document.getElementById(parts[1]);
       if (target) target.scrollIntoView();
       else window.scrollTo(0, 0);
