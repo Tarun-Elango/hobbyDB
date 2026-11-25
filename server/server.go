@@ -255,7 +255,7 @@ func (s *Server) readRedirect(ctx context.Context) (proto.Response, bool) {
 	case err == nil:
 		return proto.Response{}, false
 	case errors.Is(err, raft.ErrNotLeader):
-		return notLeaderResponse(s.leaderTarget(s.raftNode.Snapshot().LeaderID)), true
+		return notLeaderResponse(s.leaderTarget(s.raftNode.Status().LeaderID)), true
 	default:
 		return proto.Response{
 			Status: proto.StatusError,
@@ -269,9 +269,9 @@ func (s *Server) readRedirect(ctx context.Context) (proto.Response, bool) {
 // A follower answers with the leader's client address when it knows one,
 // otherwise the leader's node id.
 func (s *Server) proposeRaftWrite(ctx context.Context, cmd proto.Command) (proto.Response, error) {
-	snap := s.raftNode.Snapshot()
-	if snap.Role != raft.Leader {
-		return notLeaderResponse(s.leaderTarget(snap.LeaderID)), nil
+	st := s.raftNode.Status()
+	if st.Role != raft.Leader {
+		return notLeaderResponse(s.leaderTarget(st.LeaderID)), nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -284,7 +284,7 @@ func (s *Server) proposeRaftWrite(ctx context.Context, cmd proto.Command) (proto
 		return proto.Response{Status: proto.StatusOk}, nil
 	}
 	if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLostLeadership) {
-		return notLeaderResponse(s.leaderTarget(s.raftNode.Snapshot().LeaderID)), nil
+		return notLeaderResponse(s.leaderTarget(s.raftNode.Status().LeaderID)), nil
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return proto.Response{
