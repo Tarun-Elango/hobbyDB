@@ -62,12 +62,12 @@ func TestRejoinCatchUp(t *testing.T) {
 				}
 			}
 			res := writeLoad(c, writerConns, 3*time.Second)
-			behind := keyCount(c, c.leader(5*time.Second)) - len(pre.acks) // roughly: keys written while it was down
+			behind := len(res.acks)
 
 			t0 := time.Now()
 			c.start(f)
-			catch, ok := waitConverged(c, 30*time.Second)
-			catch = time.Since(t0)
+			_, ok := waitConverged(c, 30*time.Second)
+			catch := time.Since(t0)
 			all := append(pre.acks, res.acks...)
 			lost := lostOn(c, f, all)
 			ok = ok && lost == 0
@@ -88,11 +88,14 @@ func TestFullClusterRestart(t *testing.T) {
 	requireBench(t)
 	c := startCluster(t, clusterSize)
 	killAt := time.Now().Add(2 * time.Second)
+	killDone := make(chan struct{})
 	go func() {
+		defer close(killDone)
 		time.Sleep(time.Until(killAt))
 		c.killAll()
 	}()
 	res := writeLoad(c, writerConns, 2500*time.Millisecond)
+	<-killDone
 	c.killAll()
 
 	t0 := time.Now()
@@ -184,13 +187,16 @@ func TestPartitionSymmetric(t *testing.T) {
 
 	start := time.Now()
 	cutAt, healAt, end := start.Add(time.Second), start.Add(4*time.Second), start.Add(7*time.Second)
+	partDone := make(chan struct{})
 	go func() {
+		defer close(partDone)
 		time.Sleep(time.Until(cutAt))
 		c.partition(minority)
 		time.Sleep(time.Until(healAt))
 		c.heal()
 	}()
 	res := writeLoad(c, writerConns, end.Sub(start))
+	<-partDone
 
 	after := c.leader(5 * time.Second)
 	conv, cok := waitConverged(c, 10*time.Second)
@@ -223,7 +229,9 @@ func TestFlappingLinks(t *testing.T) {
 	start := time.Now()
 	flapFrom, flapTo, end := start.Add(500*time.Millisecond), start.Add(5500*time.Millisecond), start.Add(7*time.Second)
 	flaps := 0
+	flapDone := make(chan struct{})
 	go func() {
+		defer close(flapDone)
 		time.Sleep(time.Until(flapFrom))
 		for time.Now().Before(flapTo) {
 			c.partition(rng.Perm(clusterSize)[:2])
@@ -234,6 +242,7 @@ func TestFlappingLinks(t *testing.T) {
 		}
 	}()
 	res := writeLoad(c, writerConns, end.Sub(start))
+	<-flapDone
 	conv, cok := waitConverged(c, 10*time.Second)
 	lost := lostAnywhere(c, res.acks)
 	during := countBetween(res.acks, flapFrom, flapTo)
@@ -278,14 +287,15 @@ func TestRollingRestart(t *testing.T) {
 	<-done
 	conv, cok := waitConverged(c, 10*time.Second)
 	lost := lostAnywhere(c, res.acks)
-	ok := cok && lost == 0 && maxGap(res.acks, rollFrom, rollTo) < 2*time.Second
+	gap := maxGap(res.acks, rollFrom, rollTo)
+	ok := cok && lost == 0 && gap < 2*time.Second
 	if !ok {
-		t.Errorf("converged=%v lost=%d", cok, lost)
+		t.Errorf("converged=%v lost=%d maxGap=%s", cok, lost, gap)
 	}
 	record("Rolling restart",
 		"8 writer conns for 11 s; each node in turn gets SIGTERM, is down 300 ms, restarts, then 1 s to settle. Followers first, leader last.",
 		[]string{"writes/s before", "during roll", "max gap ms", "client errors", "converge ms", "lost", "result"},
 		[]string{rate(countBetween(res.acks, start, rollFrom), time.Second),
 			rate(countBetween(res.acks, rollFrom, rollTo), rollTo.Sub(rollFrom)),
-			ms(maxGap(res.acks, rollFrom, rollTo)), fmt.Sprint(res.errs), ms(conv), fmt.Sprint(lost), passFail(ok)})
+			ms(gap), fmt.Sprint(res.errs), ms(conv), fmt.Sprint(lost), passFail(ok)})
 }

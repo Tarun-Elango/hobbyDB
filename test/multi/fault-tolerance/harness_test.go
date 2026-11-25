@@ -3,7 +3,7 @@
 // what Raft promises: the cluster keeps serving with up to 2 of 5 nodes down,
 // refuses writes without a quorum, and never loses an acknowledged write.
 //
-// Slow, so only runs with KV_BENCH=1. Each run overwrites result.md.
+// Slow, so only runs with KV_BENCH=1. Each run overwrites results.md.
 package faulttolerance
 
 import (
@@ -27,7 +27,7 @@ import (
 
 const (
 	clusterSize = 5
-	resultFile  = "result.md"
+	resultFile  = "results.md"
 )
 
 var (

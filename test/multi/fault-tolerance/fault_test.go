@@ -55,13 +55,16 @@ func TestLeaderDown(t *testing.T) {
 			warm := time.Second
 			start := time.Now()
 			killAt := start.Add(warm)
+			killDone := make(chan struct{})
 			go func() {
+				defer close(killDone)
 				time.Sleep(time.Until(killAt))
 				for _, v := range victims {
 					c.kill(v)
 				}
 			}()
 			res := writeLoad(c, writerConns, warm+workDur())
+			<-killDone
 			end := time.Now()
 
 			var before, after int
@@ -81,7 +84,10 @@ func TestLeaderDown(t *testing.T) {
 					after++
 				}
 			}
-			failover := firstAfter.Sub(killAt)
+			var failover time.Duration
+			if !firstAfter.IsZero() {
+				failover = firstAfter.Sub(killAt)
+			}
 			lost := lostAcked(c, res.acks)
 			ok := !firstAfter.IsZero() && lost == 0
 			if !ok {

@@ -2,7 +2,7 @@
 // subprocess per node) and checks what clients can observe: linearizable
 // histories, no lost acked writes, and when reads go stale.
 //
-// Slow, so it only runs with KV_BENCH=1:
+// Slow, so it only runs with KV_BENCH=1. Each run overwrites results.md:
 //
 //	KV_BENCH=1 go test -v -count=1 ./test/multi/correctness/
 package correctness
@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +26,10 @@ import (
 	"time"
 )
 
-const clusterSize = 5
+const (
+	clusterSize = 5
+	resultFile  = "results.md"
+)
 
 var (
 	serverBin string
@@ -54,6 +58,7 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	_ = os.RemoveAll(binDir)
+	writeReport()
 	os.Exit(code)
 }
 
@@ -347,4 +352,66 @@ func (c *cluster) call(start int, cmd proto.Command, budget time.Duration) (prot
 		}
 	}
 	return proto.Response{}, false
+}
+
+func passFail(ok bool) string {
+	if ok {
+		return "PASS"
+	}
+	return "**FAIL**"
+}
+
+// ---------------------------------------------------------------- report
+
+type table struct {
+	title, note string
+	header      []string
+	rows        [][]string
+}
+
+var (
+	reportMu sync.Mutex
+	tables   []*table
+	byTitle  = map[string]*table{}
+)
+
+func record(title, note string, header, row []string) {
+	reportMu.Lock()
+	defer reportMu.Unlock()
+	tb := byTitle[title]
+	if tb == nil {
+		tb = &table{title: title, note: note, header: header}
+		byTitle[title] = tb
+		tables = append(tables, tb)
+	}
+	tb.rows = append(tb.rows, row)
+}
+
+func writeReport() {
+	reportMu.Lock()
+	defer reportMu.Unlock()
+	if len(tables) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("# Correctness, 5-node cluster\n\n")
+	fmt.Fprintf(&b, "%s · %s/%s, %d CPUs, %s · 5 `cmd/server` processes on localhost · crashes = SIGKILL · stall = SIGSTOP/SIGCONT\n\n",
+		time.Now().Format("2006-01-02 15:04"), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.Version())
+	for _, tb := range tables {
+		fmt.Fprintf(&b, "## %s\n\n", tb.title)
+		if tb.note != "" {
+			b.WriteString(tb.note + "\n\n")
+		}
+		b.WriteString("| " + strings.Join(tb.header, " | ") + " |\n")
+		b.WriteString("|" + strings.Repeat("---|", len(tb.header)) + "\n")
+		for _, r := range tb.rows {
+			b.WriteString("| " + strings.Join(r, " | ") + " |\n")
+		}
+		b.WriteString("\n")
+	}
+	if err := os.WriteFile(resultFile, []byte(b.String()), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "write report:", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nresults written to %s\n", resultFile)
 }
