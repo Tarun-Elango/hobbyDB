@@ -65,6 +65,7 @@ func run() error {
 	if opts.walPath == "" {
 		opts.walPath = "data/" + opts.nodeID + ".wal"
 	}
+
 	logx.SetEnabled(opts.verbose)
 	ctx, stop := signal.NotifyContext( // get root context, signal watches for os signals
 		context.Background(),
@@ -177,7 +178,7 @@ func runNode(ctx context.Context, opts options) error {
 		opts.nodeID,
 		opts.clientAddr,
 		opts.replicationAddr,
-		raftNode.Snapshot().CurrentTerm,
+		raftNode.Status().CurrentTerm,
 	)
 	serveErr := srv.Serve(runCtx, opts.clientAddr) // block and serve the client requests
 	cancel()

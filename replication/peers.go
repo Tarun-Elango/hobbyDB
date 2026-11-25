@@ -7,24 +7,32 @@ import (
 	"strings"
 )
 
+type peerClients struct {
+	control *TCPPeerClient // Heartbeat and RequestVote
+	append  *TCPPeerClient // AppendEntries
+}
+
 type PeerSet struct {
-	ids     []string
-	clients map[string]*TCPPeerClient
+	ids   []string
+	peers map[string]*peerClients
 }
 
 // create a new peer set from a list of specs
 func NewPeerSet(specs []string) (*PeerSet, error) {
-	set := &PeerSet{clients: make(map[string]*TCPPeerClient)}
+	set := &PeerSet{peers: make(map[string]*peerClients)}
 	for _, spec := range specs {
 		id, addr, ok := strings.Cut(spec, "=")
 		if !ok || id == "" || addr == "" {
 			return nil, fmt.Errorf("peer must look like id=host:port, got %q", spec)
 		}
-		if _, exists := set.clients[id]; exists {
+		if _, exists := set.peers[id]; exists {
 			return nil, fmt.Errorf("duplicate peer id %s", id)
 		}
 		set.ids = append(set.ids, id)
-		set.clients[id] = NewTCPPeerClient(addr)
+		set.peers[id] = &peerClients{
+			control: NewTCPPeerClient(addr),
+			append:  NewTCPPeerClient(addr),
+		}
 	}
 	return set, nil
 }
@@ -34,9 +42,15 @@ func (p *PeerSet) IDs() []string {
 }
 
 func (p *PeerSet) Close() error {
+	if p == nil {
+		return nil
+	}
 	var err error
-	for _, client := range p.clients {
-		if e := client.Close(); e != nil {
+	for _, peer := range p.peers {
+		if e := peer.control.Close(); e != nil {
+			err = e
+		}
+		if e := peer.append.Close(); e != nil {
 			err = e
 		}
 	}
@@ -48,11 +62,11 @@ func (p *PeerSet) RequestVote(
 	peerID string,
 	args raft.RequestVoteArgs,
 ) (raft.RequestVoteResult, error) {
-	clients := p.clients[peerID]
-	if clients == nil {
+	peer := p.peers[peerID]
+	if peer == nil {
 		return raft.RequestVoteResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
 	}
-	return clients.RequestVote(ctx, args)
+	return peer.control.RequestVote(ctx, args)
 }
 
 func (p *PeerSet) AppendEntries(
@@ -60,11 +74,11 @@ func (p *PeerSet) AppendEntries(
 	peerID string,
 	args raft.AppendEntriesArgs,
 ) (raft.AppendEntriesResult, error) {
-	client := p.clients[peerID]
-	if client == nil {
+	peer := p.peers[peerID]
+	if peer == nil {
 		return raft.AppendEntriesResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
 	}
-	return client.AppendEntries(ctx, args)
+	return peer.append.AppendEntries(ctx, args)
 }
 
 func (p *PeerSet) Heartbeat(
@@ -72,9 +86,9 @@ func (p *PeerSet) Heartbeat(
 	peerID string,
 	args raft.HeartbeatArgs,
 ) (raft.HeartbeatResult, error) {
-	clients := p.clients[peerID]
-	if clients == nil {
+	peer := p.peers[peerID]
+	if peer == nil {
 		return raft.HeartbeatResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
 	}
-	return clients.Heartbeat(ctx, args)
+	return peer.control.Heartbeat(ctx, args)
 }

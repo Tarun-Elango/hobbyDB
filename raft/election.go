@@ -82,9 +82,13 @@ func (n *Node) Run(ctx context.Context, rpc VoteRPC) {
 			}
 			timer.Reset(randomElectionTimeout())
 		case <-timer.C:
-			if n.Snapshot().Role == Leader {
+			if n.Status().Role == Leader {
 				// leaders don't run elections: leave the timer stopped.
 				// every leader -> follower transition pokes electionReset to re-arm it.
+				continue
+			}
+			if n.heardRecently() {
+				timer.Reset(randomElectionTimeout())
 				continue
 			}
 			_ = n.startElection(ctx, rpc) // start a new election
@@ -95,22 +99,41 @@ func (n *Node) Run(ctx context.Context, rpc VoteRPC) {
 
 // to tell the election timer to reset
 func (n *Node) pokeElectionTimer() {
+	n.lastHeard.Store(time.Now().UnixNano())
 	select {
 	case n.electionReset <- struct{}{}:
 	default: // if the channel is full, do nothing and return
 	}
 }
 
+// heardRecently reports whether a valid leader or vote message reset the
+// election timer within electionTimeoutMin.
+func (n *Node) heardRecently() bool {
+	ts := n.lastHeard.Load()
+	if ts == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, ts)) < electionTimeoutMin
+}
+
 // when this node learns about a new leader - usally during the append entries
 // recored the new leader and reset the election timer
 func (n *Node) ObserverLeader(term uint64, leaderId string) error {
-	n.mu.Lock()
-	current := n.CurrentTerm
-	n.mu.Unlock()
-
-	if term < current {
+	// Steady-state fast path: stale heartbeats and same-term follower heartbeats
+	// never touch n.mu (which may be held across WAL fsync).
+	n.metaMu.Lock()
+	if term < n.CurrentTerm {
+		n.metaMu.Unlock()
 		return nil
 	}
+	if term == n.CurrentTerm && n.Role == Follower {
+		n.LeaderID = leaderId
+		n.metaMu.Unlock()
+		n.pokeElectionTimer()
+		return nil
+	}
+	current := n.CurrentTerm
+	n.metaMu.Unlock()
 
 	if term > current {
 		if err := n.SetPersistentState(term, ""); err != nil {
@@ -119,15 +142,18 @@ func (n *Node) ObserverLeader(term uint64, leaderId string) error {
 	}
 
 	n.mu.Lock()
-	if n.CurrentTerm == term {
-		if n.Role == Leader {
+	observed := n.CurrentTerm == term
+	if observed {
+		wasLeader := n.Role == Leader
+		n.setMetaLocked(Follower, leaderId)
+		if wasLeader {
 			n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
 		}
-		n.Role = Follower
-		n.LeaderID = leaderId
 	}
 	n.mu.Unlock()
-	n.pokeElectionTimer()
+	if observed {
+		n.pokeElectionTimer()
+	}
 	return nil
 }
 
@@ -135,7 +161,7 @@ func (n *Node) ObserverLeader(term uint64, leaderId string) error {
 
 func (n *Node) startElection(ctx context.Context, rpc VoteRPC) error {
 	n.mu.Lock()
-	if n.Role == Leader { // lol already a leader
+	if n.Role == Leader || n.heardRecently() { // already a leader, or heard from a valid leader/candidate while waiting for mu
 		n.mu.Unlock()
 		return nil
 	}
@@ -156,8 +182,7 @@ func (n *Node) startElection(ctx context.Context, rpc VoteRPC) error {
 		n.mu.Unlock()
 		return nil
 	}
-	n.Role = Candidate
-	n.LeaderID = ""
+	n.setMetaLocked(Candidate, "")
 	n.mu.Unlock()
 
 	var (
@@ -223,8 +248,8 @@ func (n *Node) startElection(ctx context.Context, rpc VoteRPC) error {
 
 // node asks itself, is it a candidate? double check
 func (n *Node) isCandidate(term uint64) bool {
-	snap := n.Snapshot()
-	return snap.Role == Candidate && snap.CurrentTerm == term
+	st := n.Status()
+	return st.Role == Candidate && st.CurrentTerm == term
 }
 
 // become a leader by updating the in memory state
@@ -236,8 +261,7 @@ func (n *Node) becomeLeader(term uint64) {
 		return
 	}
 
-	n.Role = Leader
-	n.LeaderID = n.ID
+	n.setMetaLocked(Leader, n.ID)
 
 	lastIndex, _ := n.lastLogLocked()
 	n.nextIndex = make(map[string]uint64, len(n.peers))
@@ -281,8 +305,7 @@ func (n *Node) stepDown(term uint64) error {
 
 	n.mu.Lock()
 	if n.CurrentTerm == term {
-		n.Role = Follower
-		n.LeaderID = ""
+		n.setMetaLocked(Follower, "")
 		n.applyCond.Broadcast() // unblock Propose waiting to apply
 	}
 	n.mu.Unlock()
@@ -305,7 +328,7 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteResult, error
 	upToDate := LogIsUptoDate(args.LastLogIndex, args.LastLogTerm, lastIndex, lastTerm)
 
 	if args.Term > current { // we are behind, so accept their term
-		vote := "" // incase their log is not up to date, we will vote ""
+		vote := "" // in case their log is not up to date, we will vote ""
 		if upToDate {
 			vote = args.CandidateID
 		}
@@ -330,18 +353,20 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteResult, error
 func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (RequestVoteResult, error) {
 
 	if err := n.SetPersistentState(term, votedFor); err != nil {
-		snap := n.Snapshot()
+		n.mu.RLock()
+		termNow := n.CurrentTerm
+		granted := n.VotedFor == candidateId && n.CurrentTerm == term
+		n.mu.RUnlock()
 		return RequestVoteResult{
-			Term:        snap.CurrentTerm,
-			VoteGranted: snap.VotedFor == candidateId && snap.CurrentTerm == term, // if the vote is for the candidate and the term is the same
+			Term:        termNow,
+			VoteGranted: granted, // if the vote is for the candidate and the term is the same
 		}, nil
 	}
 
 	n.mu.Lock()
 	wasLeader := n.Role == Leader
 	if n.CurrentTerm == term {
-		n.Role = Follower
-		n.LeaderID = "" // dont knwo for sure, hence will update later
+		n.setMetaLocked(Follower, "") // dont knwo for sure, hence will update later
 	}
 	if wasLeader && n.Role != Leader {
 		n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
@@ -360,9 +385,9 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 // idles until becomeLeader pokes leaderWake, runs one stint per leader term.
 func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
 	for {
-		snap := n.Snapshot()
-		if snap.Role == Leader && rpc != nil {
-			n.heartbeatStint(ctx, rpc, snap.CurrentTerm)
+		st := n.Status()
+		if st.Role == Leader && rpc != nil {
+			n.heartbeatStint(ctx, rpc, st.CurrentTerm)
 			continue // maybe leader again in a newer term; re-check before idling
 		}
 		select {
@@ -380,7 +405,7 @@ func (n *Node) heartbeatStint(ctx context.Context, rpc HeartbeatRPC, term uint64
 	defer cancel()
 
 	leading := func() bool {
-		s := n.Snapshot()
+		s := n.Status()
 		return s.Role == Leader && s.CurrentTerm == term
 	}
 

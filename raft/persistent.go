@@ -116,7 +116,13 @@ func (n *Node) SetPersistentState(term uint64, votedFor string) error {
 	if err := writePersistentState(n.statePath, state); err != nil {
 		return err
 	}
+	termChanged := term > n.CurrentTerm
+	n.metaMu.Lock()
 	n.CurrentTerm = term
+	if termChanged {
+		n.LeaderID = ""
+	}
+	n.metaMu.Unlock()
 	n.VotedFor = votedFor
 	return nil
 }

@@ -713,3 +713,151 @@ func TestOpenReadsV2AndAppends(t *testing.T) {
 		t.Fatalf("records = %+v", got)
 	}
 }
+
+func TestAppendBatchAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch.wal")
+
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+
+	recs := []Record{
+		{Index: 1, Term: 1, Op: byte(OpNoop)},
+		{Index: 2, Term: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("1"), ClientID: 7, Seq: 1},
+		{Index: 3, Term: 2, Op: byte(OpSet), Key: []byte("b"), Value: []byte("2"), ClientID: 7, Seq: 2},
+		{Index: 4, Term: 2, Op: byte(OpDel), Key: []byte("a")},
+	}
+	if err := log.AppendBatch(recs); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if got := log.LastIndex(); got != 4 {
+		t.Fatalf("LastIndex() = %d, want 4", got)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close wal: %v", err)
+	}
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen wal: %v", err)
+	}
+	defer log.Close()
+
+	var got []Record
+	if err := log.Replay(func(rec Record) error {
+		got = append(got, rec)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(got) != len(recs) {
+		t.Fatalf("replayed %d records, want %d", len(got), len(recs))
+	}
+	for i := range recs {
+		if got[i].Index != recs[i].Index ||
+			got[i].Term != recs[i].Term ||
+			got[i].Op != recs[i].Op ||
+			!bytes.Equal(got[i].Key, recs[i].Key) ||
+			!bytes.Equal(got[i].Value, recs[i].Value) ||
+			got[i].ClientID != recs[i].ClientID ||
+			got[i].Seq != recs[i].Seq {
+			t.Fatalf("record %d = %#v, want %#v", i, got[i], recs[i])
+		}
+	}
+	if gotIdx := log.LastIndex(); gotIdx != 4 {
+		t.Fatalf("LastIndex() after replay = %d, want 4", gotIdx)
+	}
+}
+
+func TestAppendBatchEmptyNoop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty-batch.wal")
+
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	defer log.Close()
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	if err := log.AppendBatch(nil); err != nil {
+		t.Fatalf("AppendBatch(nil): %v", err)
+	}
+	if err := log.AppendBatch([]Record{}); err != nil {
+		t.Fatalf("AppendBatch(empty): %v", err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("file size changed on empty batch: before=%d after=%d", before.Size(), after.Size())
+	}
+	if got := log.LastIndex(); got != 0 {
+		t.Fatalf("LastIndex() = %d, want 0", got)
+	}
+}
+
+func TestAppendBatchRejectsInvalidWithoutPartialWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid-batch.wal")
+
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+
+	initial := Record{Index: 1, Term: 1, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
+	if err := log.Append(initial); err != nil {
+		t.Fatalf("append initial: %v", err)
+	}
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	// Valid record followed by invalid record must fail cleanly without writing the first record.
+	err = log.AppendBatch([]Record{
+		{Index: 2, Term: 1, Op: byte(OpSet), Key: []byte("ok"), Value: []byte("val")},
+		{Index: 3, Term: 1, Op: 99, Key: []byte("bad")},
+	})
+	if !errors.Is(err, ErrUnknownOp) {
+		t.Fatalf("AppendBatch() error = %v, want ErrUnknownOp", err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("WAL size changed after failed batch: before=%d after=%d", before.Size(), after.Size())
+	}
+	if got := log.LastIndex(); got != 1 {
+		t.Fatalf("LastIndex() = %d, want 1", got)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close wal: %v", err)
+	}
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen wal: %v", err)
+	}
+	defer log.Close()
+
+	var got []Record
+	if err := log.Replay(func(rec Record) error {
+		got = append(got, rec)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(got) != 1 || got[0].Index != 1 || string(got[0].Key) != "k" || string(got[0].Value) != "v" {
+		t.Fatalf("replayed records = %#v, want only initial record", got)
+	}
+}

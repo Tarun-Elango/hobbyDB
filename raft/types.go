@@ -4,6 +4,7 @@ import (
 	"kvStore/proto"
 	"kvStore/wal"
 	"sync"
+	"sync/atomic"
 )
 
 type Role uint8
@@ -23,6 +24,17 @@ type LogEntry struct {
 // Node holds one cluster member's Raft state (follower, candidate, or leader).
 type Node struct {
 	mu sync.RWMutex
+	// metaMu guards fast-path reads of Role, CurrentTerm, and LeaderID and is
+	// NEVER held across disk or network I/O.
+	//
+	// Strict lock order: always acquire mu before metaMu; never acquire mu while
+	// holding metaMu.
+	//   - Every writer to Role or CurrentTerm holds both mu.Lock() and metaMu.Lock(),
+	//     so readers holding either mu or metaMu observe them without races.
+	//   - Writers to LeaderID hold at least metaMu.Lock() (ObserverLeader's steady-state
+	//     fast path updates LeaderID under metaMu alone), so every reader of LeaderID
+	//     must hold metaMu.
+	metaMu sync.RWMutex
 
 	// ---- identity ----
 	ID        string
@@ -39,6 +51,7 @@ type Node struct {
 	LeaderID      string
 	peers         []string
 	electionReset chan struct{}
+	lastHeard     atomic.Int64  // UnixNano timestamp of last valid leader/vote message; 0 means never heard
 	leaderWake    chan struct{} // poked by becomeLeader to start the heartbeat stint
 
 	// ---- leader (log replication) ----
@@ -64,18 +77,55 @@ type Snapshot struct {
 	Log         []LogEntry
 }
 
+// NodeStatus is a lightweight view of leadership and term metadata.
+// Reading it acquires only metaMu (never mu) and never copies Log.
+type NodeStatus struct {
+	Role        Role
+	CurrentTerm uint64
+	LeaderID    string
+}
+
+// Status returns the node's role, term, and known leader without blocking on mu
+// (which may be held across WAL fsync) or copying the log slice.
+func (n *Node) Status() NodeStatus {
+	n.metaMu.RLock()
+	st := NodeStatus{
+		Role:        n.Role,
+		CurrentTerm: n.CurrentTerm,
+		LeaderID:    n.LeaderID,
+	}
+	n.metaMu.RUnlock()
+	return st
+}
+
+// setMetaLocked updates Role and LeaderID under metaMu.
+// Caller must hold n.mu.Lock().
+func (n *Node) setMetaLocked(role Role, leaderID string) {
+	n.metaMu.Lock()
+	n.Role = role
+	n.LeaderID = leaderID
+	n.metaMu.Unlock()
+}
+
 // copy nodes current state and return as snapshot
 func (n *Node) Snapshot() Snapshot {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
+
+	n.metaMu.RLock()
+	role := n.Role
+	term := n.CurrentTerm
+	leaderID := n.LeaderID
+	n.metaMu.RUnlock()
+
 	logCopy := append([]LogEntry(nil), n.Log...) // copies log entires to a new slice, change to orignal keep this unaffected
 
 	return Snapshot{
 		ID:          n.ID,
-		Role:        n.Role,
-		CurrentTerm: n.CurrentTerm,
+		Role:        role,
+		CurrentTerm: term,
 		VotedFor:    n.VotedFor,
-		LeaderID:    n.LeaderID,
+		LeaderID:    leaderID,
 		CommitIndex: n.CommitIndex,
 		LastApplied: n.LastApplied,
 		Log:         logCopy,

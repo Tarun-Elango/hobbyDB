@@ -372,11 +372,14 @@ func (n *Node) copiesAtLocked(index uint64) int {
 // ---- follower funcs -----
 
 func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult, error) {
-	snap := n.Snapshot()
-	if args.Term < snap.CurrentTerm {
-		return AppendEntriesResult{Term: snap.CurrentTerm, Success: false}, nil
+	st := n.Status()
+	if args.Term < st.CurrentTerm {
+		return AppendEntriesResult{Term: st.CurrentTerm, Success: false}, nil
 	}
-	if args.Term > snap.CurrentTerm {
+	// Reset the election timer before any disk I/O or lock acquisition so a slow
+	// WAL fsync or SetPersistentState cannot trigger a spurious election.
+	n.pokeElectionTimer()
+	if args.Term > st.CurrentTerm {
 		if err := n.SetPersistentState(args.Term, ""); err != nil {
 			return AppendEntriesResult{}, err
 		}
@@ -388,8 +391,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 		return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
 	}
 	wasLeader := n.Role == Leader
-	n.Role = Follower
-	n.LeaderID = args.LeaderID
+	n.setMetaLocked(Follower, args.LeaderID)
 	if wasLeader {
 		n.applyCond.Broadcast()
 		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
@@ -401,25 +403,33 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 		return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
 	}
 
+	var toAppend []LogEntry
 	for _, entry := range args.Entries {
-		haveTerm, exists := n.logTermAtLocked(entry.Index)
-		if exists && haveTerm != entry.Term {
-			if err := n.persistTruncateLocked(entry.Index); err != nil {
-				return AppendEntriesResult{}, err
+		if len(toAppend) == 0 {
+			haveTerm, exists := n.logTermAtLocked(entry.Index)
+			if exists && haveTerm != entry.Term {
+				if err := n.persistTruncateLocked(entry.Index); err != nil {
+					return AppendEntriesResult{}, err
+				}
+				n.Log = n.Log[:entry.Index-1]
+				exists = false
 			}
-			n.Log = n.Log[:entry.Index-1]
-			exists = false
+			if exists {
+				continue
+			}
 		}
-		if exists {
-			continue
-		}
-		if entry.Index != uint64(len(n.Log))+1 {
+		if entry.Index != uint64(len(n.Log))+1+uint64(len(toAppend)) {
 			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
 		}
-		if err := n.persistAppendLocked(entry); err != nil {
+		toAppend = append(toAppend, entry)
+	}
+	if len(toAppend) > 0 {
+		if err := n.persistAppendBatchLocked(toAppend); err != nil {
 			return AppendEntriesResult{}, err
 		}
-		n.Log = append(n.Log, cloneLogEntry(entry))
+		for _, entry := range toAppend {
+			n.Log = append(n.Log, cloneLogEntry(entry))
+		}
 	}
 
 	matchedThrough := args.PrevLogIndex
