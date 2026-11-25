@@ -91,3 +91,22 @@ xxd data/node-c.wal | head
 ```
 
 Raft persistent metadata (term/vote) is stored separately, e.g. `data/node-a.wal-raft.state`.
+
+## Install from a release
+
+`deploy/install.sh` installs a prebuilt server binary from GitHub Releases (Linux or macOS, amd64/arm64):
+
+```bash
+./deploy/install.sh          # latest release
+./deploy/install.sh v0.1.0   # specific version
+```
+
+It downloads the binary for your OS/CPU over HTTPS, verifies its SHA-256 checksum, and installs it to `/usr/local/bin/kvstore` (using `sudo` only if needed). It also creates a WAL directory at `~/.kvstore` (`/var/lib/kvstore` when run as root). It does not start the server; run `kvstore` with your own flags, e.g. `--wal=$HOME/.kvstore/node-a.wal`.
+
+To uninstall everything, including WAL data:
+
+```bash
+kvstore-uninstall --purge
+```
+
+Without `--purge` it removes the binary but keeps the WAL directory.

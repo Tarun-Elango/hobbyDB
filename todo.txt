@@ -1,3 +1,8 @@
+hobbyDB: a Raft KV store in Go with higher write throughput and lower p99 than etcd on a 
+3-node cluster. Same durability (fsync before ack), linearizable reads, checked under crashes
+and partitions.
+
+
 Stage 1: Give nodes shared Raft information
 Add a few things each node needs to remember:
 - Which election term it is in. A term is like an election round.
@@ -57,6 +62,9 @@ Benchmark:
 - leader failure recovery ( stop leader, restart, see how long it takes to recover)
 - mixed read/write workload
 
+Raft: fix leader flapping under concurrent write load
+With 5 nodes, writes hold ~80/s at 1-8 concurrent writers, then fall to 41 / 9 / 1 writes/s at 16 / 32 / 64 conns with hundreds of NotLeader redirects per run (see test/multi/perf/result.md). The cluster spends its time re-electing. Likely cause (unverified): heartbeats or the follower's election-timer reset wait behind batch fsyncs that exceed the 150 ms election timeout; the 80 ms replication.rpc.attempt.timeout.ms is also tight for an fsync'd batch. Once fixed, rerun the slow-follower perf test.
+
 wal settings: 
 always write to disk (fsync before OK, with group commit) 
 interval (write, reply, fsync in the background), worst case : up to that interval lost on power loss
@@ -86,5 +94,12 @@ simple health check endpoint that returns 200 if the node is healthy, 500 if it 
 expand to on disk structure, option available to enable/disable.
 
 
-Raft: fix leader flapping under concurrent write load
-With 5 nodes, writes hold ~80/s at 1-8 concurrent writers, then fall to 41 / 9 / 1 writes/s at 16 / 32 / 64 conns with hundreds of NotLeader redirects per run (see test/multi/perf/result.md). The cluster spends its time re-electing. Likely cause (unverified): heartbeats or the follower's election-timer reset wait behind batch fsyncs that exceed the 150 ms election timeout; the 80 ms replication.rpc.attempt.timeout.ms is also tight for an fsync'd batch. Once fixed, rerun the slow-follower perf test.
+--------------------------------
+
+#	Milestone	Why it matters (from your result.md files)
+1	Group commit and pipelined AppendEntries. One fsync per batch, more than one RPC in flight.	Writes don’t scale with clients (197 → 212/s on a single node from 1 to 64 clients). Batching should take you from ~100/s into the thousands. (Opportunistic drain (zero extra wait): While one persistAppendBatchLocked + fsync is running, incoming Propose calls queue up. As soon as it finishes, drain up to maxBatchSize (e.g., 64 or 128) queued entries and fsync them all together in one call.)
+2	ReadIndex or leader lease.	The stalled-leader linearizability test currently FAILs. You can’t claim etcd’s guarantees until it passes.
+3	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast.
+4	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
+5	etcd head-to-head. Same machine, 3 nodes, 1–256 clients, 128 B / 4 KiB / 64 KiB values. Report writes/s and p50/p99/p999.	This is the result you publish.
+6	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
