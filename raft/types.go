@@ -24,13 +24,14 @@ type LogEntry struct {
 // Node holds one cluster member's Raft state (follower, candidate, or leader).
 type Node struct {
 	mu sync.RWMutex
-	// metaMu guards fast-path reads of Role, CurrentTerm, and LeaderID and is
-	// NEVER held across disk or network I/O.
+	// metaMu guards fast-path reads of Role, CurrentTerm, LeaderID, CommitIndex,
+	// commitTerm, LastApplied, and peers, and is NEVER held across disk or network I/O.
 	//
 	// Strict lock order: always acquire mu before metaMu; never acquire mu while
 	// holding metaMu.
-	//   - Every writer to Role or CurrentTerm holds both mu.Lock() and metaMu.Lock(),
-	//     so readers holding either mu or metaMu observe them without races.
+	//   - Every writer to Role, CurrentTerm, CommitIndex, commitTerm, LastApplied,
+	//     or peers holds both mu.Lock() and metaMu.Lock(), so readers holding either
+	//     mu or metaMu observe them without races.
 	//   - Writers to LeaderID hold at least metaMu.Lock() (ObserverLeader's steady-state
 	//     fast path updates LeaderID under metaMu alone), so every reader of LeaderID
 	//     must hold metaMu.
@@ -61,8 +62,15 @@ type Node struct {
 
 	// ---- commit + apply to KV store ----
 	CommitIndex uint64     // highest log index known to be committed ( global)
+	commitTerm  uint64     // log term at CommitIndex (mirrored under metaMu for lock-free-of-mu reads)
 	LastApplied uint64     // highest committed index applied to the store ( purely local)
 	applyCond   *sync.Cond // wakes the apply loop and anyone waiting for an entry to be applied
+
+	// ---- leader read confirmation (ReadIndex) ----
+	// Leaf lock: never acquire mu or metaMu while holding readMu, and never hold
+	// readMu across network or disk I/O.
+	readMu    sync.Mutex
+	readStint *heartbeatStintState
 }
 
 // read only copy, thread safe
@@ -107,6 +115,23 @@ func (n *Node) setMetaLocked(role Role, leaderID string) {
 	n.metaMu.Unlock()
 }
 
+// setCommitLocked updates CommitIndex and its log term under metaMu.
+// Caller must hold n.mu.Lock().
+func (n *Node) setCommitLocked(index, term uint64) {
+	n.metaMu.Lock()
+	n.CommitIndex = index
+	n.commitTerm = term
+	n.metaMu.Unlock()
+}
+
+// setLastAppliedLocked updates LastApplied under metaMu.
+// Caller must hold n.mu.Lock().
+func (n *Node) setLastAppliedLocked(index uint64) {
+	n.metaMu.Lock()
+	n.LastApplied = index
+	n.metaMu.Unlock()
+}
+
 // copy nodes current state and return as snapshot
 func (n *Node) Snapshot() Snapshot {
 	n.mu.RLock()
@@ -145,8 +170,15 @@ func NewNode(id string) *Node {
 	return n
 }
 
+// cachedPeers returns the immutable peer slice without acquiring n.mu or allocating.
+// Callers must not mutate the returned slice.
+func (n *Node) cachedPeers() []string {
+	n.metaMu.RLock()
+	peers := n.peers
+	n.metaMu.RUnlock()
+	return peers
+}
+
 func (n *Node) peerIds() []string {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return append([]string(nil), n.peers...)
+	return append([]string(nil), n.cachedPeers()...)
 }

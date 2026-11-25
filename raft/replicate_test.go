@@ -2,8 +2,10 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,7 +444,7 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 // A new leader must not serve reads until an entry from its own term has
-// committed and the store has applied up to it.
+// committed, a majority confirms leadership, and the store has applied up to it.
 func TestWaitLeaderReadWaitsForCurrentTermApply(t *testing.T) {
 	old := LogEntry{Index: 1, Term: 1, Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")}}
 	leader := newTestLeader(t, "a", 2, []string{"b"}, []LogEntry{old})
@@ -450,6 +452,9 @@ func TestWaitLeaderReadWaitsForCurrentTermApply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go leader.RunApply(ctx, func(proto.Command) {})
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		return HeartbeatResult{Term: args.Term}, nil
+	})
 
 	done := make(chan error, 1)
 	go func() { done <- leader.WaitLeaderRead(ctx) }()
@@ -498,5 +503,298 @@ func TestWaitLeaderReadReturnsNotLeaderOnStepDown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("read not released after step down")
+	}
+}
+
+func TestWaitLeaderReadDeposedByHigherTermHeartbeat(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b", "c"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.statePath = filepath.Join(t.TempDir(), "a.raft.state")
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	var depose atomic.Bool
+	var initialAcks atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		if depose.Load() {
+			return HeartbeatResult{Term: 3}, nil
+		}
+		initialAcks.Add(1)
+		return HeartbeatResult{Term: args.Term}, nil
+	})
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		ready := leader.readStint != nil
+		leader.readMu.Unlock()
+		return ready && initialAcks.Load() >= 2
+	})
+	depose.Store(true)
+
+	readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+	defer readCancel()
+	if err := leader.WaitLeaderRead(readCtx); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("WaitLeaderRead err = %v, want ErrNotLeader", err)
+	}
+	st := leader.Status()
+	if st.Role != Follower || st.CurrentTerm != 3 {
+		t.Fatalf("status = %+v, want Follower term 3", st)
+	}
+}
+
+func TestWaitLeaderReadTimesOutWithoutQuorum(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b", "c"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		return HeartbeatResult{}, errors.New("partitioned")
+	})
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		defer leader.readMu.Unlock()
+		return leader.readStint != nil
+	})
+
+	readCtx, readCancel := context.WithTimeout(ctx, 120*time.Millisecond)
+	defer readCancel()
+	if err := leader.WaitLeaderRead(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitLeaderRead err = %v, want DeadlineExceeded", err)
+	}
+}
+
+func TestWaitLeaderReadSucceedsWithMinorityDown(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b", "c", "d", "e"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	var deadCalls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		if peerID == "d" || peerID == "e" {
+			deadCalls.Add(1)
+			<-ctx.Done() // stalled/dead minority must not delay quorum reads
+			return HeartbeatResult{}, ctx.Err()
+		}
+		return HeartbeatResult{Term: args.Term}, nil
+	})
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		defer leader.readMu.Unlock()
+		return leader.readStint != nil
+	})
+
+	// Multiple consecutive reads must succeed without piling up RPCs on dead peers.
+	for i := 0; i < 5; i++ {
+		readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+		err := leader.WaitLeaderRead(readCtx)
+		readCancel()
+		if err != nil {
+			t.Fatalf("read %d err = %v, want nil", i, err)
+		}
+	}
+	if got := deadCalls.Load(); got > 2 {
+		t.Fatalf("dead peer RPC calls = %d, want <= 2 (at most 1 in-flight per dead peer)", got)
+	}
+}
+
+func TestWaitLeaderReadDoesNotCancelSlowHealthyPeer(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b", "c"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	var initialAcks atomic.Int32
+	var slowMode atomic.Bool
+	slowEntered := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	slowDone := make(chan error, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		if !slowMode.Load() {
+			initialAcks.Add(1)
+			return HeartbeatResult{Term: args.Term}, nil
+		}
+		if peerID == "c" {
+			select {
+			case <-slowEntered:
+			default:
+				close(slowEntered)
+			}
+			select {
+			case <-ctx.Done():
+				slowDone <- ctx.Err()
+				return HeartbeatResult{}, ctx.Err()
+			case <-releaseSlow:
+				slowDone <- nil
+				return HeartbeatResult{Term: args.Term}, nil
+			}
+		}
+		return HeartbeatResult{Term: args.Term}, nil
+	})
+
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		ready := leader.readStint != nil
+		leader.readMu.Unlock()
+		return ready && initialAcks.Load() >= 2
+	})
+	slowMode.Store(true)
+
+	readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+	defer readCancel()
+	if err := leader.WaitLeaderRead(readCtx); err != nil {
+		t.Fatalf("WaitLeaderRead err = %v, want nil", err)
+	}
+
+	// Wait until c entered the RPC (if not already) and confirm its context was
+	// NOT canceled when quorum was reached via b.
+	select {
+	case <-slowEntered:
+	case <-time.After(time.Second):
+		t.Fatal("slow peer c never started read heartbeat")
+	}
+	close(releaseSlow)
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("slow healthy peer RPC canceled after quorum: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow peer c did not finish")
+	}
+}
+
+func TestWaitLeaderReadDoesNotBlockOnMu(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b", "c"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		return HeartbeatResult{Term: args.Term}, nil
+	})
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		defer leader.readMu.Unlock()
+		return leader.readStint != nil
+	})
+
+	// Hold n.mu.Lock() to simulate an in-flight WAL fsync in Propose.
+	leader.mu.Lock()
+	defer leader.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		readCtx, readCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer readCancel()
+		done <- leader.WaitLeaderRead(readCtx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitLeaderRead err = %v, want nil", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("WaitLeaderRead blocked while n.mu.Lock() was held")
+	}
+}
+
+func TestWaitLeaderReadCoalescesWithoutReusingInFlightRound(t *testing.T) {
+	leader := newTestLeader(t, "a", 2, []string{"b"}, []LogEntry{
+		{Index: 1, Term: 2, Command: proto.Command{Op: proto.OpNoop}},
+	})
+	leader.mu.Lock()
+	leader.setCommitLocked(1, 2)
+	leader.setLastAppliedLocked(1)
+	leader.mu.Unlock()
+
+	var readPhase atomic.Bool
+	var calls atomic.Int32
+	initialDone := make(chan struct{})
+	round1Started := make(chan struct{})
+	releaseRound1 := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leader.RunHeartbeats(ctx, func(ctx context.Context, peerID string, args HeartbeatArgs) (HeartbeatResult, error) {
+		if !readPhase.Load() {
+			select {
+			case <-initialDone:
+			default:
+				close(initialDone)
+			}
+			return HeartbeatResult{Term: args.Term}, nil
+		}
+		n := calls.Add(1)
+		if n == 1 {
+			close(round1Started)
+			<-releaseRound1
+		}
+		return HeartbeatResult{Term: args.Term}, nil
+	})
+
+	<-initialDone
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		defer leader.readMu.Unlock()
+		return leader.readStint != nil
+	})
+	readPhase.Store(true)
+
+	err1 := make(chan error, 1)
+	go func() { err1 <- leader.WaitLeaderRead(ctx) }()
+	<-round1Started
+
+	// Launch 4 readers while round 1 is already in flight. None may complete on
+	// round 1, and all 4 must share a single round 2.
+	const waiters = 4
+	errNext := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() { errNext <- leader.WaitLeaderRead(ctx) }()
+	}
+	waitFor(t, func() bool {
+		leader.readMu.Lock()
+		defer leader.readMu.Unlock()
+		return leader.readStint != nil && leader.readStint.pending != nil && leader.readStint.pending.waiters == waiters
+	})
+
+	close(releaseRound1)
+	if err := <-err1; err != nil {
+		t.Fatalf("round 1 err = %v", err)
+	}
+	for i := 0; i < waiters; i++ {
+		if err := <-errNext; err != nil {
+			t.Fatalf("coalesced reader %d err = %v", i, err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("heartbeat rounds = %d, want 2 (1 initial + 1 coalesced)", got)
 	}
 }

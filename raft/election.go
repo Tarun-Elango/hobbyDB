@@ -147,6 +147,7 @@ func (n *Node) ObserverLeader(term uint64, leaderId string) error {
 		wasLeader := n.Role == Leader
 		n.setMetaLocked(Follower, leaderId)
 		if wasLeader {
+			n.cancelReadRound()
 			n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
 		}
 	}
@@ -306,7 +307,8 @@ func (n *Node) stepDown(term uint64) error {
 	n.mu.Lock()
 	if n.CurrentTerm == term {
 		n.setMetaLocked(Follower, "")
-		n.applyCond.Broadcast() // unblock Propose waiting to apply
+		n.cancelReadRound()
+		n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting to apply
 	}
 	n.mu.Unlock()
 	n.pokeElectionTimer()
@@ -369,6 +371,7 @@ func (n *Node) recordVote(term uint64, votedFor string, candidateId string) (Req
 		n.setMetaLocked(Follower, "") // dont knwo for sure, hence will update later
 	}
 	if wasLeader && n.Role != Leader {
+		n.cancelReadRound()
 		n.applyCond.Broadcast() // unblock Propose / WaitLeaderRead waiting on this leader
 		n.pokeElectionTimer()   // re-arm the timer a leader leaves stopped
 	}
@@ -399,49 +402,112 @@ func (n *Node) RunHeartbeats(ctx context.Context, rpc HeartbeatRPC) {
 }
 
 // heartbeat every peer until ctx ends or this node stops leading `term`.
-// the first heartbeat goes out immediately, then one per tick.
+// Each peer has one persistent worker that handles both periodic heartbeats and
+// ReadIndex confirmation rounds over its live TCP connection without canceling
+// healthy peers when quorum is reached.
 func (n *Node) heartbeatStint(ctx context.Context, rpc HeartbeatRPC, term uint64) {
 	stintCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	peers := n.cachedPeers()
+	stint := newHeartbeatStintState(term, peers, cancel)
+	n.registerReadStint(stint)
+	defer func() {
+		n.abortReadStint(stint, ErrNotLeader)
+	}()
 
-	leading := func() bool {
-		s := n.Status()
-		return s.Role == Leader && s.CurrentTerm == term
+	// Re-check after registering readStint so a step-down racing with startup
+	// cannot leave an orphaned stint.
+	if !n.isLeadingTerm(term) {
+		return
+	}
+
+	interval := electionTimeoutMin / 3
+
+	// no peers (single node): nothing to send, so wait out the leadership instead of spinning
+	if len(peers) == 0 {
+		for n.isLeadingTerm(term) {
+			select {
+			case <-stintCtx.Done():
+				return
+			case <-time.After(interval):
+			}
+		}
+		return
 	}
 
 	var wg sync.WaitGroup
-	for _, peer := range n.peerIds() {
+	for idx, peer := range peers {
 		wg.Add(1)
-		go func(peer string) {
+		go func(peerIdx int, peer string) {
 			defer wg.Done()
-			ticker := time.NewTicker(electionTimeoutMin / 3)
-			defer ticker.Stop()
-
-			for {
-				if !leading() {
-					return
-				}
-				res, err := rpc(stintCtx, peer, HeartbeatArgs{Term: term, LeaderID: n.ID})
-				if err == nil && res.Term > term {
-					_ = n.stepDown(res.Term)
-					return
-				}
-				select {
-				case <-stintCtx.Done():
-					return
-				case <-ticker.C:
-				}
-			}
-		}(peer)
+			n.runPeerHeartbeats(stintCtx, stint, rpc, peerIdx, peer, interval)
+		}(idx, peer)
 	}
 	wg.Wait()
+}
 
-	// no peers (single node): nothing to send, so wait out the leadership instead of spinning
-	for leading() {
-		select {
-		case <-ctx.Done():
+func (n *Node) isLeadingTerm(term uint64) bool {
+	s := n.Status()
+	return s.Role == Leader && s.CurrentTerm == term
+}
+
+func (n *Node) runPeerHeartbeats(
+	stintCtx context.Context,
+	stint *heartbeatStintState,
+	rpc HeartbeatRPC,
+	peerIdx int,
+	peer string,
+	interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	wake := stint.wake[peerIdx]
+	args := HeartbeatArgs{Term: stint.term, LeaderID: n.ID}
+
+	var lastAttemptedRound uint64
+	sendNow := true // first heartbeat goes out immediately upon becoming leader
+
+	for {
+		if stintCtx.Err() != nil || !n.isLeadingTerm(stint.term) {
 			return
-		case <-time.After(electionTimeoutMin / 3):
+		}
+
+		roundID := n.nextPeerReadRound(stint, lastAttemptedRound)
+		if roundID > 0 {
+			lastAttemptedRound = roundID
+			sendNow = true
+		}
+
+		if sendNow {
+			sendNow = false
+			res, err := rpc(stintCtx, peer, args)
+			if stintCtx.Err() != nil {
+				return
+			}
+			if err == nil && res.Term > stint.term {
+				_ = n.stepDown(res.Term)
+				n.abortReadStint(stint, ErrNotLeader)
+				return
+			}
+			if roundID > 0 {
+				n.reportHeartbeatOutcome(stint, peerIdx, roundID, res, err)
+			}
+			// A heartbeat just completed; push back the next periodic tick so we
+			// avoid redundant periodic heartbeats during active read traffic.
+			ticker.Reset(interval)
+			select {
+			case <-ticker.C:
+			default:
+			}
+			continue
+		}
+
+		select {
+		case <-stintCtx.Done():
+			return
+		case <-wake:
+		case <-ticker.C:
+			sendNow = true
 		}
 	}
 }
