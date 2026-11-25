@@ -60,12 +60,20 @@ jobs:
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
+            # server: kestrel-<os>-<arch>.tar.gz
             name="kestrel-${os}-${arch}"
             mkdir -p "build/${name}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
               go build -trimpath -ldflags="-s -w" -o "build/${name}/kestrel" ./cmd/server
             tar -C "build/${name}" --owner=0 --group=0 --numeric-owner \
               -czf "dist/${name}.tar.gz" kestrel
+            # client: kestrel-cli-<os>-<arch>.tar.gz
+            name="kestrel-cli-${os}-${arch}"
+            mkdir -p "build/${name}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" -o "build/${name}/kestrel-cli" ./client
+            tar -C "build/${name}" --owner=0 --group=0 --numeric-owner \
+              -czf "dist/${name}.tar.gz" kestrel-cli
           done
           (cd dist && sha256sum *.tar.gz > checksums.txt)
           cat dist/checksums.txt
