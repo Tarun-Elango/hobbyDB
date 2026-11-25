@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Installs the kvstore server binary from a GitHub release (Linux or macOS).
+# Installs the kestrel server binary (kestrelKV) from a GitHub release (Linux or macOS).
 #
 #   ./install.sh            # latest release
 #   ./install.sh v0.1.0     # specific release
 #
 # Installs:
-#   /usr/local/bin/kvstore            the server binary (uses sudo only if needed)
-#   /usr/local/bin/kvstore-uninstall  removes everything this script added
-#   ~/.kvstore                        data dir for the WAL (/var/lib/kvstore when run as root)
+#   /usr/local/bin/kestrel            the server binary (uses sudo only if needed)
+#   /usr/local/bin/kestrel-uninstall  removes everything this script added
+#   ~/.kestrel                        data dir for the WAL (/var/lib/kestrel when run as root)
 #
 # Override locations with BIN_DIR=... and DATA_DIR=... env vars.
 # It does not start the server.
 set -euo pipefail
 
-REPO="Tarun-Elango/hobbyDB"
+REPO="Tarun-Elango/kestrelKV"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 if [[ "$(id -u)" -eq 0 ]]; then
-  DATA_DIR="${DATA_DIR:-/var/lib/kvstore}"
+  DATA_DIR="${DATA_DIR:-/var/lib/kestrel}"
 else
-  DATA_DIR="${DATA_DIR:-$HOME/.kvstore}"
+  DATA_DIR="${DATA_DIR:-$HOME/.kestrel}"
 fi
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -64,13 +64,13 @@ if [[ -z "$VERSION" ]]; then
 fi
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "invalid version: '$VERSION'"
 
-ASSET="kvstore-${OS}-${ARCH}.tar.gz"
+ASSET="kestrel-${OS}-${ARCH}.tar.gz"
 BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Downloading kvstore ${VERSION} (${OS}/${ARCH})..."
+echo "Downloading kestrel ${VERSION} (${OS}/${ARCH})..."
 fetch -o "$TMP/$ASSET" "$BASE_URL/$ASSET"
 fetch -o "$TMP/checksums.txt" "$BASE_URL/checksums.txt"
 
@@ -80,22 +80,22 @@ expected="$(awk -v f="$ASSET" '$2 == f {print $1}' "$TMP/checksums.txt")"
 [[ "$(sha256 "$TMP/$ASSET")" == "$expected" ]] || die "checksum mismatch, aborting"
 
 # Extract only the binary, ignoring ownership/permissions stored in the archive.
-tar -xzf "$TMP/$ASSET" -C "$TMP" --no-same-owner --no-same-permissions kvstore
-[[ -f "$TMP/kvstore" && ! -L "$TMP/kvstore" ]] || die "archive did not contain the kvstore binary"
+tar -xzf "$TMP/$ASSET" -C "$TMP" --no-same-owner --no-same-permissions kestrel
+[[ -f "$TMP/kestrel" && ! -L "$TMP/kestrel" ]] || die "archive did not contain the kestrel binary"
 
 $SUDO mkdir -p "$BIN_DIR"
-$SUDO install -m 0755 "$TMP/kvstore" "$BIN_DIR/kvstore"
+$SUDO install -m 0755 "$TMP/kestrel" "$BIN_DIR/kestrel"
 mkdir -p "$DATA_DIR"
 chmod 0700 "$DATA_DIR"
 
-cat > "$TMP/kvstore-uninstall" <<EOF
+cat > "$TMP/kestrel-uninstall" <<EOF
 #!/usr/bin/env bash
 # Removes what install.sh added. Keeps WAL data unless --purge is given.
-#   kvstore-uninstall           # remove binary, keep $DATA_DIR
-#   kvstore-uninstall --purge   # also delete $DATA_DIR
+#   kestrel-uninstall           # remove binary, keep $DATA_DIR
+#   kestrel-uninstall --purge   # also delete $DATA_DIR
 set -euo pipefail
-if pgrep -x kvstore >/dev/null 2>&1; then
-  echo "error: kvstore is still running, stop it first" >&2; exit 1
+if pgrep -x kestrel >/dev/null 2>&1; then
+  echo "error: kestrel is still running, stop it first" >&2; exit 1
 fi
 SUDO=""
 [[ -w "$BIN_DIR" ]] || SUDO="sudo"
@@ -108,20 +108,20 @@ if [[ "\${1:-}" == "--purge" ]]; then
 else
   echo "WAL data kept in $DATA_DIR (use --purge to delete it)"
 fi
-\$SUDO rm -f "$BIN_DIR/kvstore" "$BIN_DIR/kvstore-uninstall"
-echo "kvstore removed"
+\$SUDO rm -f "$BIN_DIR/kestrel" "$BIN_DIR/kestrel-uninstall"
+echo "kestrel removed"
 EOF
-$SUDO install -m 0755 "$TMP/kvstore-uninstall" "$BIN_DIR/kvstore-uninstall"
+$SUDO install -m 0755 "$TMP/kestrel-uninstall" "$BIN_DIR/kestrel-uninstall"
 
 cat <<EOF
 
-kvstore ${VERSION} installed to ${BIN_DIR}/kvstore
+kestrel ${VERSION} installed to ${BIN_DIR}/kestrel
 WAL directory: ${DATA_DIR}
 
 Start it with your flags, for example:
-  kvstore --node-id=node-a --wal=${DATA_DIR}/node-a.wal \\
+  kestrel --node-id=node-a --wal=${DATA_DIR}/node-a.wal \\
     --client-addr=:9000 --replication-addr=:9001 --peers=...
 
-Uninstall:  kvstore-uninstall          (keeps WAL data)
-            kvstore-uninstall --purge  (deletes WAL data too)
+Uninstall:  kestrel-uninstall          (keeps WAL data)
+            kestrel-uninstall --purge  (deletes WAL data too)
 EOF

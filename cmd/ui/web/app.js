@@ -1,4 +1,4 @@
-// kvStore cluster monitor: plain JS, no build step.
+// kestrelKV cluster monitor: plain JS, no build step.
 //
 // Contract with the Go server (cmd/ui):
 //
@@ -408,7 +408,7 @@
   });
 
   logEl.innerHTML = '<li class="empty">waiting for events…</li>';
-  print("kvStore console — commands: set <key> <value>, get <key>, del <key>, len, ping", "hint");
+  print("kestrelKV console — commands: set <key> <value>, get <key>, del <key>, len, ping", "hint");
   $("#foot-mode").textContent = useMock ? "MOCK CLUSTER · SIMULATED" : `LIVE · ${location.host}`;
   api.subscribe({ state: renderState, log: addLog, link: setLink });
 

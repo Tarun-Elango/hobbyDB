@@ -2,104 +2,13 @@ hobbyDB: a Raft KV store in Go with higher write throughput and lower p99 than e
 3-node cluster. Same durability (fsync before ack), linearizable reads, checked under crashes
 and partitions.
 
-
-Stage 1: Give nodes shared Raft information
-Add a few things each node needs to remember:
-- Which election term it is in. A term is like an election round.
-- Which node it voted for in that round.
-- Which log entries are committed and ready to apply.
-After this stage: nodes have the information they need to take part in Raft.
-
-Stage 2: Save important information across restarts
-Update the WAL so each saved command includes its term. Save the current term and vote too.
-Why: if a node restarts, it must remember enough to avoid voting twice in one round or forgetting the history of its log.
-
-Stage 3: Make every node start as a follower
-When a node starts, it loads its saved data, then waits for messages from its peers. No node is manually marked as leader.
-After this stage: startup is ready for automatic elections.
-
-Stage 4: Hold an election when the leader seems missing
-Define fixed cluster membership and quorum size. A follower waits for a random amount of time. If it hasn’t heard from a leader, it starts an election and asks the other nodes to vote for it.
-Grant a vote only if the candidate’s log is at least as up to date as your own.
-If a candidate gets votes from more than half the cluster, it becomes leader.
-Example: in a 3-node cluster, a candidate needs 2 votes.
-
-Stage 5: Let nodes send Raft messages to each other
-Extend the existing peer network so every node can send and receive messages for elections and log updates. Handle timeouts, retries, and duplicate or delayed messages.
-After this stage: nodes can ask for votes and tell peers who the leader is.
-
-Stage 6: Have the leader copy new writes to peers
-When the leader receives a write, it adds the command to its log and sends it to the other nodes, including the previous log index and term. If a peer’s log doesn’t match, the leader backs up and retries from an earlier point.
-After this stage: nodes can get their logs back in sync.
-
-Stage 7: Decide when a write is safe
-The leader waits until a majority of nodes have the write in their logs. It advances the commit index only for entries from its current term.
-Why: if one node fails, the other nodes still have enough information to keep the committed write.
-
-Stage 8: Apply committed writes to the key-value store
-Only committed writes change the visible key-value data. Apply them in order, one at a time.
-After this stage: a client gets success only after the write is safely stored by a majority and applied.
-
-Stage 9: Connect the client server to Raft
-Change the client write path:
-1. Client sends a write to a node.
-2. If that node is leader, it proposes the write to Raft.
-3. Raft copies it to peers and waits for a majority.
-4. The node applies the committed write and replies success.
-5. If the node isn’t leader, it tells the client who the leader is, if known.
-
-Stage 10: Check the cluster’s behavior
-Check that elections work, writes wait for a majority, failed nodes can rejoin, and restarted nodes recover their saved data.
-
--- current
-
-Benchmark:
-- write throughput
-- write latency by cluster size
-- payload size ( small, large values) check write throughput and latency
-- read throughput
-- follower catchup time ( stop follower, restart, see how long it takes to catch up)
-- leader failure recovery ( stop leader, restart, see how long it takes to recover)
-- mixed read/write workload
-
-Raft: fix leader flapping under concurrent write load
-With 5 nodes, writes hold ~80/s at 1-8 concurrent writers, then fall to 41 / 9 / 1 writes/s at 16 / 32 / 64 conns with hundreds of NotLeader redirects per run (see test/multi/perf/result.md). The cluster spends its time re-electing. Likely cause (unverified): heartbeats or the follower's election-timer reset wait behind batch fsyncs that exceed the 150 ms election timeout; the 80 ms replication.rpc.attempt.timeout.ms is also tight for an fsync'd batch. Once fixed, rerun the slow-follower perf test.
-
-wal settings: 
-always write to disk (fsync before OK, with group commit) 
-interval (write, reply, fsync in the background), worst case : up to that interval lost on power loss
-never, worst case: whatever the OS hadn’t flushed
-
-WAL optimization: Batch writes to disk (group commit)
-Queue concurrent writes through a single ordered writer. Collect a batch up to a configurable byte/count limit or short time limit, append its WAL records together, and call file.Sync() once per batch instead of once per command. Preserve index ordering and apply writes only after the batch sync succeeds; reply success only after the required durability and replication conditions are met. Restructure the current writeMu path so requests can join a batch while earlier requests wait for durability. Bound the queue for backpressure, propagate append/sync failures to affected requests, and drain pending writes on graceful shutdown. Measure throughput and latency to choose batch limits.
-increase batch when follower is catching up with the leader.
-
-allow all followers to be always upto date with the leader. quorum = all nodes.
-
-Store optimization: Shard the map
-Split the store into, for example, 32 shards, each with its own map and RWMutex; hash(key) & 31 selects the shard. Even read locks increment and decrement a shared atomic reader counter, so concurrent GETs on different CPU cores compete for the same cache line today. Sharding spreads that traffic and reduces interference between reads and writes. Measure whether adjacent shard locks need padding to avoid false sharing. Account for the extra key hashing and hot keys, and coordinate all shards to preserve Replace's atomic semantics. The server already serializes writes with writeMu, so the main expected benefit is concurrent GET throughput. Before comparing results, precompute benchmark keys and use a local counter per goroutine instead of fmt.Sprintf and a shared atomic counter in every iteration.
-
-Store optimization: Store bytes in chunks and index them with integer offsets
-If millions of entries make heap size and GC CPU significant, consider replacing map[string][]byte with a map[uint64]Entry containing only integer offsets, lengths, and collision metadata, backed by a few large byte chunks. Hash each key, find candidate entries, and compare stored key bytes to resolve collisions correctly. Pointer-free map entries let Go skip scanning their storage, while chunks can reduce per-entry allocations and metadata overhead. This requires reclaiming deleted or overwritten data, compaction, collision handling, and keeping returned []byte values valid. Pursue this redesign only when measurements justify its complexity; try sharding first.
-
-Replication and WAL: Add snapshots and log compaction
-Periodically persist a consistent snapshot of the key-value state at an applied, committed log index, including its term and the metadata needed for recovery. Make the snapshot durable and publish it atomically before removing the covered WAL records or in-memory replication entries. Retain the suffix after the snapshot and recover by loading the snapshot, then replaying that suffix. Replace assumptions that log indices start at 1 or equal slice positions with a snapshot/base index. Release references to compacted entries so their copied keys and values can be garbage-collected, and reclaim unused backing storage. Add snapshot installation for followers that fall behind the retained log; they must be able to recover even after the leader has discarded their missing history. Trigger compaction using retained log bytes or entry count, and cover crash recovery, concurrent writes during snapshots, and follower catchup across the compaction boundary. This bounds retained history between compactions; the live dataset must still fit in memory.
-
-gossip protocol:
-allow to add/remove nodes to the cluster dynamically, and also dynamically manage the current cluster membership.
-
-health check:
-simple health check endpoint that returns 200 if the node is healthy, 500 if it is not.
-
-expand to on disk structure, option available to enable/disable.
-
-
 --------------------------------
 
-#	Milestone	Why it matters (from your result.md files)
 1	Group commit and pipelined AppendEntries. One fsync per batch, more than one RPC in flight.	Writes don’t scale with clients (197 → 212/s on a single node from 1 to 64 clients). Batching should take you from ~100/s into the thousands. (Opportunistic drain (zero extra wait): While one persistAppendBatchLocked + fsync is running, incoming Propose calls queue up. As soon as it finishes, drain up to maxBatchSize (e.g., 64 or 128) queued entries and fsync them all together in one call.)
 2	ReadIndex or leader lease.	The stalled-leader linearizability test currently FAILs. You can’t claim etcd’s guarantees until it passes.
 3	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast.
 4	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
 5	etcd head-to-head. Same machine, 3 nodes, 1–256 clients, 128 B / 4 KiB / 64 KiB values. Report writes/s and p50/p99/p999.	This is the result you publish.
 6	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
+7.  check/add settings to tweak consitency / availability, and performance
+8.  update readme and docs
