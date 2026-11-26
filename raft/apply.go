@@ -100,14 +100,35 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 			n.mu.Unlock()
 			continue
 		}
-		entry := cloneLogEntry(n.Log[next-1])
+		end := n.CommitIndex
+		if end > uint64(len(n.Log)) {
+			end = uint64(len(n.Log))
+		}
+		applyLimit := uint64(proposeMaxBatchSize)
+		if applyLimit < 256 {
+			applyLimit = 256
+		}
+		if end-next+1 > applyLimit {
+			end = next + applyLimit - 1
+		}
+		entries := make([]LogEntry, 0, int(end-next+1))
+		for idx := next; idx <= end; idx++ {
+			e := n.Log[idx-1]
+			if e.Index != idx {
+				break
+			}
+			entries = append(entries, cloneLogEntry(e))
+		}
 		n.mu.Unlock()
 
-		apply(entry.Command)
+		for _, entry := range entries {
+			apply(entry.Command)
+		}
 
+		lastApplied := entries[len(entries)-1].Index
 		n.mu.Lock()
-		if n.LastApplied < entry.Index {
-			n.setLastAppliedLocked(entry.Index)
+		if n.LastApplied < lastApplied {
+			n.setLastAppliedLocked(lastApplied)
 		}
 		n.applyCond.Broadcast()
 		n.mu.Unlock()

@@ -5,15 +5,16 @@ and partitions.
 --------------------------------
 
 1	Group commit and pipelined AppendEntries. One fsync per batch, more than one RPC in flight.	Writes don’t scale with clients (197 → 212/s on a single node from 1 to 64 clients). Batching should take you from ~100/s into the thousands. (Opportunistic drain (zero extra wait): While one persistAppendBatchLocked + fsync is running, incoming Propose calls queue up. As soon as it finishes, drain up to maxBatchSize (e.g., 64 or 128) queued entries and fsync them all together in one call.)
-2	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast.
-3	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
-3.5 pre vote -Adding Raft Pre-Vote would eliminate the 320 ms leader-change disruption seen when a minority partition heals.
+2	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
+3   pre vote -Adding Raft Pre-Vote would eliminate the 320 ms leader-change disruption seen when a minority partition heals.
 
 4	etcd head-to-head. Same machine, 3 nodes, 1–256 clients, 128 B / 4 KiB / 64 KiB values. Report writes/s and p50/p99/p999.	This is the result you publish.
 5	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
 6.  check/add settings to tweak consitency / availability, and performance
 8.  Dispatch AppendEntries to followers in parallel with the leader's own WAL fsync, and only advance CommitIndex once a quorum (counting the leader only after its own fsync returns) has persisted.
 7.  update readme and docs and flow
+8.  shard map
+2	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast. - not dealing with it now 
 
 research ideas
 - CURP: 1-RTT Commutative Replication on Top of Raft

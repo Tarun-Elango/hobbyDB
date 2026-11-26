@@ -154,10 +154,10 @@ func runNode(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
-	go raftNode.Run(runCtx, peerSet.RequestVote)                   // run the election timer in its own goroutine
-	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)           // run the heartbeat timer in its own goroutine
-	go raftNode.RunReplication(runCtx, peerSet.AppendEntries)      // copy the leader log to peers
-	go raftNode.RunApply(runCtx, server.NewStateMachine(st).Apply) // apply committed entries in order, each client write once
+	go raftNode.Run(runCtx, peerSet.RequestVote)                         // run the election timer in its own goroutine
+	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)                 // run the heartbeat timer in its own goroutine
+	go raftNode.RunReplicationPipelined(runCtx, peerSet.AppendPipeline)  // pipeline leader log replication to peers
+	go raftNode.RunApply(runCtx, server.NewStateMachine(st).Apply)       // apply committed entries in order, each client write once
 
 	srv := server.New(st, server.Config{
 		RaftNode:    raftNode,

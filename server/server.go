@@ -209,7 +209,7 @@ func (s *Server) dispatch(ctx context.Context, cmd proto.Command) (proto.Respons
 		if resp, redirect := s.readRedirect(ctx); redirect {
 			return resp, nil
 		}
-		val, ok := s.store.Get(string(cmd.Key))
+		val, ok := store.GetBytes(s.store, cmd.Key)
 		if !ok {
 			return proto.Response{Status: proto.StatusNotFound}, nil
 		}

@@ -66,6 +66,119 @@ func TestGetSetDelete(t *testing.T) {
 
 }
 
+func TestGetBytes(t *testing.T) {
+	st := NewStore[string, []byte]()
+	st.Set("hello-world-key-exceeding-small-string-size", []byte("val"))
+
+	key := []byte("hello-world-key-exceeding-small-string-size")
+	v, ok := GetBytes(st, key)
+	if !ok || string(v) != "val" {
+		t.Fatalf("GetBytes got (%q, %v), want (%q, true)", v, ok, "val")
+	}
+
+	if _, ok := GetBytes(st, []byte("missing")); ok {
+		t.Fatalf("expected ok=false for missing key")
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		_, _ = GetBytes(st, key)
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs for GetBytes, got %v", allocs)
+	}
+}
+
+func TestReplace(t *testing.T) {
+	st := NewStore[string, []byte]()
+	st.Set("old-1", []byte("a"))
+	st.Set("old-2", []byte("b"))
+
+	replacement := make(map[string][]byte, 200)
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("new-%d", i)
+		replacement[k] = []byte(fmt.Sprintf("val-%d", i))
+	}
+	st.Replace(replacement)
+
+	if st.Len() != 200 {
+		t.Fatalf("expected len=200 after Replace, got %d", st.Len())
+	}
+	if _, ok := st.Get("old-1"); ok {
+		t.Fatalf("expected old key to be removed after Replace")
+	}
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("new-%d", i)
+		want := fmt.Sprintf("val-%d", i)
+		v, ok := st.Get(k)
+		if !ok || string(v) != want {
+			t.Fatalf("Get(%q) = (%q, %v), want (%q, true)", k, v, ok, want)
+		}
+		vb, ok := GetBytes(st, []byte(k))
+		if !ok || string(vb) != want {
+			t.Fatalf("GetBytes(%q) = (%q, %v), want (%q, true)", k, vb, ok, want)
+		}
+	}
+
+	// Replace with empty map clears store.
+	st.Replace(nil)
+	if st.Len() != 0 {
+		t.Fatalf("expected len=0 after Replace(nil), got %d", st.Len())
+	}
+}
+
+func TestConcurrentReplace(t *testing.T) {
+	st := NewStore[string, int]()
+	const keys = 100
+
+	var wg sync.WaitGroup
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				_, _ = st.Get(fmt.Sprintf("k-%d", i%keys))
+				_ = st.Len()
+			}
+		}()
+	}
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for iter := 0; iter < 25; iter++ {
+				m := make(map[string]int, keys)
+				for i := 0; i < keys; i++ {
+					m[fmt.Sprintf("k-%d", i)] = id*100 + iter
+				}
+				st.Replace(m)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if st.Len() != keys {
+		t.Fatalf("expected len=%d after concurrent Replace, got %d", keys, st.Len())
+	}
+}
+
+func TestMustShardCount(t *testing.T) {
+	for _, good := range []int{1, 2, 16, 64, 256} {
+		if got := mustShardCount(good); got != good {
+			t.Fatalf("mustShardCount(%d) = %d", good, got)
+		}
+	}
+	for _, bad := range []int{-1, 0, 3, 6, 48, 100} {
+		func(n int) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("mustShardCount(%d) did not panic", n)
+				}
+			}()
+			mustShardCount(n)
+		}(bad)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	st := NewStore[string, int]()
 

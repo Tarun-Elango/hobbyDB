@@ -798,3 +798,780 @@ func TestWaitLeaderReadCoalescesWithoutReusingInFlightRound(t *testing.T) {
 		t.Fatalf("heartbeat rounds = %d, want 2 (1 initial + 1 coalesced)", got)
 	}
 }
+
+func TestProposeGroupCommitCoalescesAndRespectsMaxBatchSize(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	logPath := filepath.Join(dir, "raft.log")
+
+	leader, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.SetPersistentState(1, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.OpenLog(logPath); err != nil {
+		t.Fatal(err)
+	}
+	defer leader.CloseLog()
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.mu.Unlock()
+
+	origLimit := proposeMaxBatchSize
+	proposeMaxBatchSize = 4
+	t.Cleanup(func() { proposeMaxBatchSize = origLimit })
+
+	var batchMu sync.Mutex
+	var batchSizes []int
+	leader.onProposeBatch = func(n int) {
+		batchMu.Lock()
+		batchSizes = append(batchSizes, n)
+		batchMu.Unlock()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st := store.NewStore[string, []byte]()
+	go leader.RunApply(ctx, func(cmd proto.Command) {
+		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+	})
+
+	// Hold n.mu to simulate an in-flight WAL fsync for proposal 0 while proposals 1..9 queue up.
+	leader.mu.Lock()
+
+	const total = 10 // 1 in-flight + 9 queued -> batches [1, 4, 4, 1]
+	results := make(chan proposeResult, total)
+	// Start proposal 0 first so it becomes the active flusher.
+	go func() {
+		e, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		results <- proposeResult{entry: e, err: err}
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+
+	for i := 1; i < total; i++ {
+		i := i
+		go func() {
+			k := []byte{byte('a' + i)}
+			v := []byte{byte('A' + i)}
+			e, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: k, Value: v})
+			results <- proposeResult{entry: e, err: err}
+		}()
+	}
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == total-1
+	})
+
+	// Release n.mu so the first flush and opportunistic drain batches run.
+	leader.mu.Unlock()
+
+	seenIndices := make(map[uint64]bool, total)
+	for i := 0; i < total; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("propose %d failed: %v", i, res.err)
+		}
+		if seenIndices[res.entry.Index] {
+			t.Fatalf("duplicate log index %d", res.entry.Index)
+		}
+		seenIndices[res.entry.Index] = true
+	}
+
+	batchMu.Lock()
+	gotBatches := append([]int(nil), batchSizes...)
+	batchMu.Unlock()
+	wantBatches := []int{1, 4, 4, 1}
+	if len(gotBatches) != len(wantBatches) {
+		t.Fatalf("batch sizes = %v, want %v", gotBatches, wantBatches)
+	}
+	for i := range wantBatches {
+		if gotBatches[i] != wantBatches[i] {
+			t.Fatalf("batch sizes = %v, want %v", gotBatches, wantBatches)
+		}
+	}
+
+	// Verify WAL durability across reopen.
+	if err := leader.CloseLog(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.OpenLog(logPath); err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseLog()
+	if got := len(reopened.Snapshot().Log); got != total {
+		t.Fatalf("reopened log len = %d, want %d", got, total)
+	}
+}
+
+func TestProposeGroupCommitSkipsCanceledQueuedRequests(t *testing.T) {
+	leader := NewNode("a")
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.CurrentTerm = 1
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go leader.RunApply(ctx, func(proto.Command) {})
+
+	leader.mu.Lock()
+	res0 := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		res0 <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+
+	cancelCtx, cancelReq := context.WithCancel(ctx)
+	resCanceled := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(cancelCtx, proto.Command{Op: proto.OpSet, Key: []byte("drop"), Value: []byte("x")})
+		resCanceled <- err
+	}()
+	resLive := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("keep"), Value: []byte("y")})
+		resLive <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == 2
+	})
+
+	// Cancel one queued proposal before the flush runs.
+	cancelReq()
+	if err := <-resCanceled; !errors.Is(err, context.Canceled) {
+		leader.mu.Unlock()
+		t.Fatalf("canceled propose err = %v, want context.Canceled", err)
+	}
+
+	leader.mu.Unlock()
+
+	if err := <-res0; err != nil {
+		t.Fatalf("propose 0 err = %v", err)
+	}
+	if err := <-resLive; err != nil {
+		t.Fatalf("live propose err = %v", err)
+	}
+
+	log := leader.Snapshot().Log
+	if len(log) != 2 {
+		t.Fatalf("log len = %d, want 2 (canceled queued proposal should not be logged): %+v", len(log), log)
+	}
+	if string(log[1].Command.Key) != "keep" {
+		t.Fatalf("log[1].Key = %q, want keep", log[1].Command.Key)
+	}
+}
+
+func TestProposeGroupCommitFailsQueuedOnStepDown(t *testing.T) {
+	leader := NewNode("a")
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.CurrentTerm = 1
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	leader.mu.Lock()
+	errCh := make(chan error, 3)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		errCh <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+	for i := 1; i < 3; i++ {
+		go func() {
+			_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")})
+			errCh <- err
+		}()
+	}
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == 2
+	})
+
+	// Step down while proposals are waiting to flush.
+	leader.setMetaLocked(Follower, "b")
+	leader.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if err := <-errCh; !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("propose %d err = %v, want ErrNotLeader", i, err)
+		}
+	}
+	if got := len(leader.Snapshot().Log); got != 0 {
+		t.Fatalf("log len = %d, want 0", got)
+	}
+}
+
+type orderedMockPipeline struct {
+	mu      sync.Mutex
+	respCh  chan AppendPipelineResponse
+	onSend  func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error
+	onReset func()
+}
+
+func newOrderedMockPipeline(onSend func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error) *orderedMockPipeline {
+	return &orderedMockPipeline{
+		respCh: make(chan AppendPipelineResponse, 64),
+		onSend: onSend,
+	}
+}
+
+func (p *orderedMockPipeline) Send(ctx context.Context, args AppendEntriesArgs, meta any) error {
+	return p.onSend(ctx, args, func(res AppendEntriesResult, err error) {
+		p.respCh <- AppendPipelineResponse{Meta: meta, Res: res, Err: err}
+	})
+}
+
+func (p *orderedMockPipeline) Responses() <-chan AppendPipelineResponse {
+	return p.respCh
+}
+
+func (p *orderedMockPipeline) Reset() {
+	p.mu.Lock()
+	fn := p.onReset
+	p.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+func TestPipelinedReplicationProbeThenMaxInFlight(t *testing.T) {
+	origBatch := appendEntriesBatchLimit
+	origMax := appendMaxInFlight
+	appendEntriesBatchLimit = 2
+	appendMaxInFlight = 4
+	t.Cleanup(func() {
+		appendEntriesBatchLimit = origBatch
+		appendMaxInFlight = origMax
+	})
+
+	entries := make([]LogEntry, 12) // 6 batches of 2
+	for i := range entries {
+		entries[i] = LogEntry{
+			Index:   uint64(i + 1),
+			Term:    1,
+			Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")},
+		}
+	}
+	leader := newTestLeader(t, "a", 1, []string{"b"}, entries)
+	leader.nextIndex["b"] = 1
+	follower := NewNode("b")
+	follower.CurrentTerm = 1
+
+	var (
+		mu             sync.Mutex
+		inFlight       int
+		maxObserved    int
+		probeChecked   bool
+		pendingReplies []func()
+		probeArrived   = make(chan struct{}, 1)
+		fourInFlight   = make(chan struct{}, 1)
+	)
+
+	pipe := newOrderedMockPipeline(func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error {
+		mu.Lock()
+		inFlight++
+		cur := inFlight
+		if cur > maxObserved {
+			maxObserved = cur
+		}
+		isProbe := !probeChecked
+		if isProbe {
+			select {
+			case probeArrived <- struct{}{}:
+			default:
+			}
+			pendingReplies = append(pendingReplies, func() {
+				res, err := follower.HandleAppendEntries(args)
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+				reply(res, err)
+			})
+			mu.Unlock()
+			return nil
+		}
+		if cur == 4 {
+			select {
+			case fourInFlight <- struct{}{}:
+			default:
+			}
+		}
+		// Hold batches 2..5 until 4 are simultaneously in flight, then release cleanly.
+		if cur <= 4 && len(args.Entries) > 0 && args.Entries[0].Index <= 9 {
+			pendingReplies = append(pendingReplies, func() {
+				res, err := follower.HandleAppendEntries(args)
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+				reply(res, err)
+			})
+			mu.Unlock()
+			return nil
+		}
+		mu.Unlock()
+
+		res, err := follower.HandleAppendEntries(args)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		reply(res, err)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		leader.RunReplicationPipelined(ctx, func(peerID string) (AppendPipeline, error) {
+			return pipe, nil
+		})
+	}()
+	defer func() {
+		cancel()
+		<-repDone
+	}()
+
+	// 1) Wait for initial probe; while it is in flight, no second batch may be sent.
+	select {
+	case <-probeArrived:
+	case <-time.After(time.Second):
+		t.Fatal("initial probe not sent")
+	}
+	time.Sleep(30 * time.Millisecond)
+	mu.Lock()
+	if inFlight != 1 {
+		mu.Unlock()
+		t.Fatalf("in-flight during probe = %d, want 1", inFlight)
+	}
+	probeChecked = true
+	probeReply := pendingReplies[0]
+	pendingReplies = pendingReplies[1:]
+	mu.Unlock()
+
+	// 2) Complete probe -> leader should enter modeReplicate and fill 4 in-flight slots.
+	probeReply()
+	select {
+	case <-fourInFlight:
+	case <-time.After(time.Second):
+		mu.Lock()
+		got := maxObserved
+		mu.Unlock()
+		t.Fatalf("expected 4 concurrent in-flight batches after probe, maxObserved = %d", got)
+	}
+
+	// Verify we never exceed appendMaxInFlight.
+	time.Sleep(20 * time.Millisecond)
+	mu.Lock()
+	if maxObserved != 4 {
+		mu.Unlock()
+		t.Fatalf("maxObserved = %d, want 4", maxObserved)
+	}
+	toRelease := append([]func(){}, pendingReplies...)
+	pendingReplies = nil
+	mu.Unlock()
+
+	// Release held batches in FIFO order.
+	for _, fn := range toRelease {
+		fn()
+	}
+
+	waitFor(t, func() bool {
+		s := follower.Snapshot()
+		return len(s.Log) == 12 && s.CommitIndex == 12
+	})
+}
+
+func TestPipelinedReplicationUpdatesSentCommitOnNonEmptyAppend(t *testing.T) {
+	origBatch := appendEntriesBatchLimit
+	origMax := appendMaxInFlight
+	origRefresh := commitRefreshInterval
+	appendEntriesBatchLimit = 2
+	appendMaxInFlight = 4
+	commitRefreshInterval = 10 * time.Second // keep idle refresh out of the way
+	t.Cleanup(func() {
+		appendEntriesBatchLimit = origBatch
+		appendMaxInFlight = origMax
+		commitRefreshInterval = origRefresh
+	})
+
+	// Leader has 4 entries, and CommitIndex is ALREADY 4 (e.g. committed via another peer).
+	entries := make([]LogEntry, 4)
+	for i := range entries {
+		entries[i] = LogEntry{
+			Index:   uint64(i + 1),
+			Term:    1,
+			Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")},
+		}
+	}
+	leader := newTestLeader(t, "a", 1, []string{"b", "c"}, entries)
+	leader.mu.Lock()
+	leader.nextIndex["b"] = 1
+	leader.matchIndex["b"] = 0
+	leader.nextIndex["c"] = 5
+	leader.matchIndex["c"] = 4
+	leader.setCommitLocked(4, 1)
+	leader.mu.Unlock()
+
+	followerB := NewNode("b")
+	followerB.CurrentTerm = 1
+
+	var (
+		mu           sync.Mutex
+		emptyToB     int
+		nonEmptyToB  int
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		leader.RunReplicationPipelined(ctx, func(peerID string) (AppendPipeline, error) {
+			return newOrderedMockPipeline(func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error {
+				if peerID == "c" {
+					reply(AppendEntriesResult{Term: 1, Success: true}, nil)
+					return nil
+				}
+				mu.Lock()
+				if len(args.Entries) == 0 {
+					emptyToB++
+				} else {
+					nonEmptyToB++
+				}
+				mu.Unlock()
+				res, err := followerB.HandleAppendEntries(args)
+				reply(res, err)
+				return nil
+			}), nil
+		})
+	}()
+	defer func() {
+		cancel()
+		<-repDone
+	}()
+
+	// Peer b catches up in 2 non-empty batches:
+	//   batch 1: [1..2] with LeaderCommit=4 -> effectiveCommit = min(4,2) = 2
+	//   batch 2: [3..4] with LeaderCommit=4 -> effectiveCommit = min(4,4) = 4
+	// Because sentCommit is updated on non-empty AppendEntries, NO empty commit-only
+	// RPC should be sent to b once batch 2 succeeds.
+	waitFor(t, func() bool {
+		s := followerB.Snapshot()
+		return len(s.Log) == 4 && s.CommitIndex == 4
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	gotEmpty := emptyToB
+	gotNonEmpty := nonEmptyToB
+	mu.Unlock()
+	if gotNonEmpty != 2 {
+		t.Fatalf("non-empty RPCs to b = %d, want 2", gotNonEmpty)
+	}
+	if gotEmpty != 0 {
+		t.Fatalf("empty commit-only RPCs to b = %d, want 0 (non-empty AppendEntries already carried CommitIndex=4)", gotEmpty)
+	}
+}
+
+func TestPipelinedReplicationMismatchRewindsOnceAndIgnoresStaleReplies(t *testing.T) {
+	origBatch := appendEntriesBatchLimit
+	origMax := appendMaxInFlight
+	appendEntriesBatchLimit = 2
+	appendMaxInFlight = 4
+	t.Cleanup(func() {
+		appendEntriesBatchLimit = origBatch
+		appendMaxInFlight = origMax
+	})
+
+	entries := make([]LogEntry, 10)
+	for i := range entries {
+		entries[i] = LogEntry{
+			Index:   uint64(i + 1),
+			Term:    1,
+			Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")},
+		}
+	}
+	leader := newTestLeader(t, "a", 1, []string{"b"}, entries)
+	leader.nextIndex["b"] = 1
+
+	follower := NewNode("b")
+	follower.CurrentTerm = 1
+
+	var (
+		mu             sync.Mutex
+		wipedOnce      bool
+		held           []func()
+		threeHeld      = make(chan struct{}, 1)
+		rejectedFirst  bool
+		probeAfterWipe bool
+		maxAfterWipe   int
+		curAfterWipe   int
+	)
+
+	pipe := newOrderedMockPipeline(func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error {
+		mu.Lock()
+		// Let probe [1..2] succeed so leader enters modeReplicate.
+		if !wipedOnce {
+			if len(args.Entries) > 0 && args.Entries[0].Index == 1 {
+				wipedOnce = true
+				mu.Unlock()
+				res, err := follower.HandleAppendEntries(args)
+				reply(res, err)
+				return nil
+			}
+		}
+
+		// Simulate follower wiping its log right after probe [1..2] succeeded.
+		// Hold the 3 pipelined batches [3..4], [5..6], [7..8] so all 3 are in flight
+		// when batch [3..4] fails.
+		if !rejectedFirst && len(args.Entries) > 0 && args.Entries[0].Index >= 3 {
+			held = append(held, func() {
+				res, err := follower.HandleAppendEntries(args)
+				reply(res, err)
+			})
+			if len(held) == 3 {
+				follower = NewNode("b")
+				follower.CurrentTerm = 1
+				rejectedFirst = true
+				select {
+				case threeHeld <- struct{}{}:
+				default:
+				}
+			}
+			mu.Unlock()
+			return nil
+		}
+
+		// After the mismatch rewind, track in-flight concurrency during recovery.
+		if probeAfterWipe {
+			curAfterWipe++
+			if curAfterWipe > maxAfterWipe {
+				maxAfterWipe = curAfterWipe
+			}
+		}
+		mu.Unlock()
+
+		res, err := follower.HandleAppendEntries(args)
+		mu.Lock()
+		if probeAfterWipe {
+			curAfterWipe--
+		}
+		mu.Unlock()
+		reply(res, err)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		leader.RunReplicationPipelined(ctx, func(peerID string) (AppendPipeline, error) {
+			return pipe, nil
+		})
+	}()
+	defer func() {
+		cancel()
+		<-repDone
+	}()
+
+	select {
+	case <-threeHeld:
+	case <-time.After(time.Second):
+		t.Fatal("expected 3 pipelined batches held before wipe")
+	}
+
+	mu.Lock()
+	toFail := append([]func(){}, held...)
+	held = nil
+	probeAfterWipe = true
+	mu.Unlock()
+
+	// All 3 fail against the wiped follower; only the first should rewind nextIndex
+	// (the remaining 2 are stale generation and must be ignored).
+	for _, fn := range toFail {
+		fn()
+	}
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		f := follower
+		mu.Unlock()
+		s := f.Snapshot()
+		return len(s.Log) == 10 && s.CommitIndex == 10
+	})
+}
+
+func TestPipelinedReplicationHigherTermOnStaleReplyStepsDown(t *testing.T) {
+	origBatch := appendEntriesBatchLimit
+	origMax := appendMaxInFlight
+	appendEntriesBatchLimit = 1
+	appendMaxInFlight = 2
+	t.Cleanup(func() {
+		appendEntriesBatchLimit = origBatch
+		appendMaxInFlight = origMax
+	})
+
+	entries := []LogEntry{
+		{Index: 1, Term: 1, Command: proto.Command{Op: proto.OpSet, Key: []byte("k1"), Value: []byte("v1")}},
+		{Index: 2, Term: 1, Command: proto.Command{Op: proto.OpSet, Key: []byte("k2"), Value: []byte("v2")}},
+		{Index: 3, Term: 1, Command: proto.Command{Op: proto.OpSet, Key: []byte("k3"), Value: []byte("v3")}},
+	}
+	leader := newTestLeader(t, "a", 1, []string{"b"}, entries)
+	leader.statePath = filepath.Join(t.TempDir(), "a.raft.state")
+	leader.nextIndex["b"] = 1
+
+	var (
+		mu       sync.Mutex
+		calls    int
+		reply2   func(AppendEntriesResult, error)
+		reply3   func(AppendEntriesResult, error)
+		twoReady = make(chan struct{}, 1)
+	)
+
+	pipe := newOrderedMockPipeline(func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error {
+		mu.Lock()
+		calls++
+		n := calls
+		if n == 1 {
+			mu.Unlock()
+			reply(AppendEntriesResult{Term: 1, Success: true}, nil)
+			return nil
+		}
+		if n == 2 {
+			reply2 = reply
+			mu.Unlock()
+			return nil
+		}
+		if n == 3 {
+			reply3 = reply
+			select {
+			case twoReady <- struct{}{}:
+			default:
+			}
+			mu.Unlock()
+			return nil
+		}
+		mu.Unlock()
+		reply(AppendEntriesResult{Term: 1, Success: false}, nil)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		leader.RunReplicationPipelined(ctx, func(peerID string) (AppendPipeline, error) {
+			return pipe, nil
+		})
+	}()
+	defer func() {
+		cancel()
+		<-repDone
+	}()
+
+	select {
+	case <-twoReady:
+	case <-time.After(time.Second):
+		t.Fatal("expected 2 pipelined calls in flight")
+	}
+
+	// Reject #2 (bumps generation), then send a higher term on stale #3.
+	reply2(AppendEntriesResult{Term: 1, Success: false}, nil)
+	time.Sleep(15 * time.Millisecond)
+	reply3(AppendEntriesResult{Term: 5, Success: false}, nil)
+
+	waitFor(t, func() bool {
+		st := leader.Status()
+		return st.Role == Follower && st.CurrentTerm == 5
+	})
+}
+
+func TestPipelinedReplicationTransportErrorRewindsAndRecovers(t *testing.T) {
+	origBatch := appendEntriesBatchLimit
+	origMax := appendMaxInFlight
+	origBackoff := appendRetryBackoff
+	appendEntriesBatchLimit = 2
+	appendMaxInFlight = 4
+	appendRetryBackoff = 10 * time.Millisecond
+	t.Cleanup(func() {
+		appendEntriesBatchLimit = origBatch
+		appendMaxInFlight = origMax
+		appendRetryBackoff = origBackoff
+	})
+
+	entries := make([]LogEntry, 8)
+	for i := range entries {
+		entries[i] = LogEntry{
+			Index:   uint64(i + 1),
+			Term:    1,
+			Command: proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")},
+		}
+	}
+	leader := newTestLeader(t, "a", 1, []string{"b"}, entries)
+	leader.nextIndex["b"] = 1
+	follower := NewNode("b")
+	follower.CurrentTerm = 1
+
+	var (
+		mu      sync.Mutex
+		dropped bool
+	)
+
+	pipe := newOrderedMockPipeline(func(ctx context.Context, args AppendEntriesArgs, reply func(AppendEntriesResult, error)) error {
+		mu.Lock()
+		shouldDrop := !dropped && len(args.Entries) > 0 && args.Entries[0].Index == 3
+		if shouldDrop {
+			dropped = true
+		}
+		mu.Unlock()
+		if shouldDrop {
+			reply(AppendEntriesResult{}, errors.New("connection reset"))
+			return nil
+		}
+		res, err := follower.HandleAppendEntries(args)
+		reply(res, err)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		leader.RunReplicationPipelined(ctx, func(peerID string) (AppendPipeline, error) {
+			return pipe, nil
+		})
+	}()
+	defer func() {
+		cancel()
+		<-repDone
+	}()
+
+	waitFor(t, func() bool {
+		s := follower.Snapshot()
+		return len(s.Log) == 8 && s.CommitIndex == 8
+	})
+}
