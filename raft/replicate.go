@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"kvStore/config"
 	"kvStore/proto"
 	"sync"
@@ -20,9 +21,17 @@ var (
 	appendEntriesBatchLimit = config.Int("raft.append.entries.batch.limit")
 	maxAppendEntriesPayload = config.Int("raft.append.entries.max.payload")
 	appendRetryBackoff      = config.Duration("raft.append.retry.backoff.ms")
+	proposeMaxBatchSize     = mustPositiveInt("raft.propose.max.batch.size", config.Int("raft.propose.max.batch.size"))
 	// how often an idle leader re-sends its commit index to a caught-up peer
 	commitRefreshInterval = electionTimeoutMin
 )
+
+func mustPositiveInt(key string, n int) int {
+	if n <= 0 {
+		panic(fmt.Sprintf("config: %s must be positive, got %d", key, n))
+	}
+	return n
+}
 
 // AppendEntries RPC: leader copies log entries to peers and reports its commit index.
 
@@ -78,33 +87,164 @@ func cloneLogEntry(entry LogEntry) LogEntry {
 
 // ---- leader funcs
 
-// records the command in the leader's log.
+type proposeReq struct {
+	ctx  context.Context
+	cmd  proto.Command
+	done chan proposeResult
+}
+
+type proposeResult struct {
+	entry LogEntry
+	err   error
+}
+
+// records the command in the leader's log using group commit (opportunistic drain).
+// If no WAL persist is currently running, the first caller flushes immediately
+// with zero extra wait; concurrent callers arriving while that persist+fsync is
+// in flight queue up and are drained together (up to proposeMaxBatchSize) in a
+// single WAL write + fsync as soon as the current flush finishes.
 // returns only after that entry is committed by a majority and applied to the store.
 // commitIndex moves inside this call only when this node is already a majority (a single-node cluster).
 func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.Role != Leader {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return LogEntry{}, err
+	}
+	if n.Status().Role != Leader {
 		return LogEntry{}, ErrNotLeader
 	}
 
-	lastIndex, _ := n.lastLogLocked()
-	entry := LogEntry{
-		Index: lastIndex + 1,
-		Term:  n.CurrentTerm,
-		Command: proto.Command{
+	req := &proposeReq{
+		ctx: ctx,
+		cmd: proto.Command{
 			Op:       cmd.Op,
 			Key:      append([]byte(nil), cmd.Key...),
 			Value:    append([]byte(nil), cmd.Value...),
 			ClientID: cmd.ClientID,
 			Seq:      cmd.Seq,
 		},
+		done: make(chan proposeResult, 1),
 	}
-	if err := n.persistAppendLocked(entry); err != nil { // durable before anyone can count it
-		return LogEntry{}, err
+
+	var initialBatch []*proposeReq
+	n.proposeMu.Lock()
+	if !n.proposeFlushing {
+		n.proposeFlushing = true
+		initialBatch = []*proposeReq{req}
+	} else {
+		n.proposeQueue = append(n.proposeQueue, req)
 	}
-	n.Log = append(n.Log, entry) // add new entry to log
+	n.proposeMu.Unlock()
+
+	if initialBatch != nil {
+		n.flushProposeBatch(initialBatch)
+		n.proposeMu.Lock()
+		if len(n.proposeQueue) > 0 {
+			// Hand off draining the remaining queued proposals so this caller
+			// proceeds directly to apply-wait without waiting on later batches.
+			go n.drainProposeLoop()
+		} else {
+			n.proposeFlushing = false
+		}
+		n.proposeMu.Unlock()
+	}
+
+	var res proposeResult
+	select {
+	case res = <-req.done:
+	case <-ctx.Done():
+		return LogEntry{}, ctx.Err()
+	}
+	if res.err != nil {
+		return LogEntry{}, res.err
+	}
+	return n.waitProposeApplied(ctx, res.entry)
+}
+
+func (n *Node) drainProposeLoop() {
+	for {
+		batch := n.popProposeBatch()
+		if len(batch) == 0 {
+			return
+		}
+		n.flushProposeBatch(batch)
+	}
+}
+
+func (n *Node) popProposeBatch() []*proposeReq {
+	n.proposeMu.Lock()
+	defer n.proposeMu.Unlock()
+
+	if len(n.proposeQueue) == 0 {
+		n.proposeFlushing = false
+		return nil
+	}
+
+	limit := proposeMaxBatchSize
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > len(n.proposeQueue) {
+		limit = len(n.proposeQueue)
+	}
+
+	batch := make([]*proposeReq, limit)
+	copy(batch, n.proposeQueue[:limit])
+	remaining := copy(n.proposeQueue, n.proposeQueue[limit:])
+	clear(n.proposeQueue[remaining:])
+	n.proposeQueue = n.proposeQueue[:remaining]
+	return batch
+}
+
+func (n *Node) flushProposeBatch(batch []*proposeReq) {
+	live := batch[:0]
+	for _, req := range batch {
+		if err := req.ctx.Err(); err != nil {
+			req.done <- proposeResult{err: err}
+			continue
+		}
+		live = append(live, req)
+	}
+	if len(live) == 0 {
+		return
+	}
+
+	n.mu.Lock()
+	if n.Role != Leader {
+		n.mu.Unlock()
+		for _, req := range live {
+			req.done <- proposeResult{err: ErrNotLeader}
+		}
+		return
+	}
+
+	lastIndex, _ := n.lastLogLocked()
+	term := n.CurrentTerm
+	entries := make([]LogEntry, len(live))
+	for i, req := range live {
+		entries[i] = LogEntry{
+			Index:   lastIndex + uint64(i) + 1,
+			Term:    term,
+			Command: req.cmd,
+		}
+	}
+
+	// Durable before anyone can count the entries: one WAL write and one fsync
+	// for the entire batch.
+	if err := n.persistAppendBatchLocked(entries); err != nil {
+		n.mu.Unlock()
+		for _, req := range live {
+			req.done <- proposeResult{err: err}
+		}
+		return
+	}
+	if n.onProposeBatch != nil {
+		n.onProposeBatch(len(entries))
+	}
+
+	n.Log = append(n.Log, entries...)
 	n.advanceCommitLocked()
 
 	for _, ch := range n.peerWake {
@@ -112,6 +252,39 @@ func (n *Node) Propose(ctx context.Context, cmd proto.Command) (LogEntry, error)
 		case ch <- struct{}{}:
 		default:
 		}
+	}
+	n.mu.Unlock()
+
+	for i, req := range live {
+		req.done <- proposeResult{entry: entries[i]}
+	}
+}
+
+func (n *Node) waitProposeApplied(ctx context.Context, entry LogEntry) (LogEntry, error) {
+	// Fast path: if already applied while still leader in entry.Term, return
+	// without acquiring n.mu (which may be held by the next batch's WAL fsync).
+	n.metaMu.RLock()
+	if n.Role != Leader || n.CurrentTerm != entry.Term {
+		n.metaMu.RUnlock()
+		return LogEntry{}, ErrLostLeadership
+	}
+	if n.LastApplied >= entry.Index {
+		n.metaMu.RUnlock()
+		return entry, nil
+	}
+	n.metaMu.RUnlock()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.Role != Leader || n.CurrentTerm != entry.Term {
+		return LogEntry{}, ErrLostLeadership
+	}
+	if n.LastApplied >= entry.Index {
+		return entry, nil
+	}
+	if ctx.Err() != nil {
+		return LogEntry{}, ctx.Err()
 	}
 
 	// ctx cancel has to wake this wait; applyCond alone only fires on commit/apply.

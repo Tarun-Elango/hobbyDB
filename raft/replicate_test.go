@@ -798,3 +798,230 @@ func TestWaitLeaderReadCoalescesWithoutReusingInFlightRound(t *testing.T) {
 		t.Fatalf("heartbeat rounds = %d, want 2 (1 initial + 1 coalesced)", got)
 	}
 }
+
+func TestProposeGroupCommitCoalescesAndRespectsMaxBatchSize(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	logPath := filepath.Join(dir, "raft.log")
+
+	leader, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.SetPersistentState(1, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.OpenLog(logPath); err != nil {
+		t.Fatal(err)
+	}
+	defer leader.CloseLog()
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.mu.Unlock()
+
+	origLimit := proposeMaxBatchSize
+	proposeMaxBatchSize = 4
+	t.Cleanup(func() { proposeMaxBatchSize = origLimit })
+
+	var batchMu sync.Mutex
+	var batchSizes []int
+	leader.onProposeBatch = func(n int) {
+		batchMu.Lock()
+		batchSizes = append(batchSizes, n)
+		batchMu.Unlock()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st := store.NewStore[string, []byte]()
+	go leader.RunApply(ctx, func(cmd proto.Command) {
+		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+	})
+
+	// Hold n.mu to simulate an in-flight WAL fsync for proposal 0 while proposals 1..9 queue up.
+	leader.mu.Lock()
+
+	const total = 10 // 1 in-flight + 9 queued -> batches [1, 4, 4, 1]
+	results := make(chan proposeResult, total)
+	// Start proposal 0 first so it becomes the active flusher.
+	go func() {
+		e, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		results <- proposeResult{entry: e, err: err}
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+
+	for i := 1; i < total; i++ {
+		i := i
+		go func() {
+			k := []byte{byte('a' + i)}
+			v := []byte{byte('A' + i)}
+			e, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: k, Value: v})
+			results <- proposeResult{entry: e, err: err}
+		}()
+	}
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == total-1
+	})
+
+	// Release n.mu so the first flush and opportunistic drain batches run.
+	leader.mu.Unlock()
+
+	seenIndices := make(map[uint64]bool, total)
+	for i := 0; i < total; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("propose %d failed: %v", i, res.err)
+		}
+		if seenIndices[res.entry.Index] {
+			t.Fatalf("duplicate log index %d", res.entry.Index)
+		}
+		seenIndices[res.entry.Index] = true
+	}
+
+	batchMu.Lock()
+	gotBatches := append([]int(nil), batchSizes...)
+	batchMu.Unlock()
+	wantBatches := []int{1, 4, 4, 1}
+	if len(gotBatches) != len(wantBatches) {
+		t.Fatalf("batch sizes = %v, want %v", gotBatches, wantBatches)
+	}
+	for i := range wantBatches {
+		if gotBatches[i] != wantBatches[i] {
+			t.Fatalf("batch sizes = %v, want %v", gotBatches, wantBatches)
+		}
+	}
+
+	// Verify WAL durability across reopen.
+	if err := leader.CloseLog(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenNode("a", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.OpenLog(logPath); err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseLog()
+	if got := len(reopened.Snapshot().Log); got != total {
+		t.Fatalf("reopened log len = %d, want %d", got, total)
+	}
+}
+
+func TestProposeGroupCommitSkipsCanceledQueuedRequests(t *testing.T) {
+	leader := NewNode("a")
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.CurrentTerm = 1
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go leader.RunApply(ctx, func(proto.Command) {})
+
+	leader.mu.Lock()
+	res0 := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		res0 <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+
+	cancelCtx, cancelReq := context.WithCancel(ctx)
+	resCanceled := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(cancelCtx, proto.Command{Op: proto.OpSet, Key: []byte("drop"), Value: []byte("x")})
+		resCanceled <- err
+	}()
+	resLive := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("keep"), Value: []byte("y")})
+		resLive <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == 2
+	})
+
+	// Cancel one queued proposal before the flush runs.
+	cancelReq()
+	if err := <-resCanceled; !errors.Is(err, context.Canceled) {
+		leader.mu.Unlock()
+		t.Fatalf("canceled propose err = %v, want context.Canceled", err)
+	}
+
+	leader.mu.Unlock()
+
+	if err := <-res0; err != nil {
+		t.Fatalf("propose 0 err = %v", err)
+	}
+	if err := <-resLive; err != nil {
+		t.Fatalf("live propose err = %v", err)
+	}
+
+	log := leader.Snapshot().Log
+	if len(log) != 2 {
+		t.Fatalf("log len = %d, want 2 (canceled queued proposal should not be logged): %+v", len(log), log)
+	}
+	if string(log[1].Command.Key) != "keep" {
+		t.Fatalf("log[1].Key = %q, want keep", log[1].Command.Key)
+	}
+}
+
+func TestProposeGroupCommitFailsQueuedOnStepDown(t *testing.T) {
+	leader := NewNode("a")
+	leader.mu.Lock()
+	leader.setMetaLocked(Leader, "a")
+	leader.CurrentTerm = 1
+	leader.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	leader.mu.Lock()
+	errCh := make(chan error, 3)
+	go func() {
+		_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k0"), Value: []byte("v0")})
+		errCh <- err
+	}()
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return leader.proposeFlushing
+	})
+	for i := 1; i < 3; i++ {
+		go func() {
+			_, err := leader.Propose(ctx, proto.Command{Op: proto.OpSet, Key: []byte("k"), Value: []byte("v")})
+			errCh <- err
+		}()
+	}
+	waitFor(t, func() bool {
+		leader.proposeMu.Lock()
+		defer leader.proposeMu.Unlock()
+		return len(leader.proposeQueue) == 2
+	})
+
+	// Step down while proposals are waiting to flush.
+	leader.setMetaLocked(Follower, "b")
+	leader.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if err := <-errCh; !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("propose %d err = %v, want ErrNotLeader", i, err)
+		}
+	}
+	if got := len(leader.Snapshot().Log); got != 0 {
+		t.Fatalf("log len = %d, want 0", got)
+	}
+}

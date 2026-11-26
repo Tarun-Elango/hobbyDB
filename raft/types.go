@@ -60,6 +60,14 @@ type Node struct {
 	matchIndex map[string]uint64        // highest index known copied on each peer
 	peerWake   map[string]chan struct{} // wake per-peer replication workers
 
+	// ---- leader proposal group commit ----
+	// Leaf lock: never acquire mu, metaMu, or readMu while holding proposeMu,
+	// and never hold proposeMu across disk or network I/O.
+	proposeMu       sync.Mutex
+	proposeQueue    []*proposeReq
+	proposeFlushing bool
+	onProposeBatch  func(batchSize int) // optional test hook called per flushed batch
+
 	// ---- commit + apply to KV store ----
 	CommitIndex uint64     // highest log index known to be committed ( global)
 	commitTerm  uint64     // log term at CommitIndex (mirrored under metaMu for lock-free-of-mu reads)
