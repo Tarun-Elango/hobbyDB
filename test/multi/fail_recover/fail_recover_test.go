@@ -67,7 +67,9 @@ func TestRejoinCatchUp(t *testing.T) {
 			if wipe {
 				files, _ := filepath.Glob(c.nodes[f].wal + "*")
 				for _, p := range files {
-					_ = os.Remove(p)
+					if err := os.RemoveAll(p); err != nil {
+						t.Fatalf("wipe %s: %v", p, err)
+					}
 				}
 			}
 			res := writeLoad(c, writerConns, 3*time.Second)

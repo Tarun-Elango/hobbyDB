@@ -313,6 +313,52 @@ func (c *TCPPeerClient) AppendEntries(
 	return raft.AppendEntriesResult{}, last
 }
 
+// InstallSnapshot sends one snapshot chunk RPC from leader to follower.
+func (c *TCPPeerClient) InstallSnapshot(
+	ctx context.Context,
+	args raft.InstallSnapshotArgs,
+) (raft.InstallSnapshotResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var last error
+	for attempts := 0; attempts < rpcAttempts; attempts++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, appendAttemptTimeout)
+		var res raft.InstallSnapshotResult
+		err := c.roundTrip(attemptCtx,
+			func(conn net.Conn) error { return EncodeInstallSnapshot(conn, args) },
+			func(conn net.Conn) error {
+				frame, err := readFrame(conn)
+				if err != nil {
+					return err
+				}
+				if frame.messageType != messageInstallSnapshotRes {
+					return fmt.Errorf("replication: unexpected frame type: %d", frame.messageType)
+				}
+				res, err = DecodeInstallSnapshotResultPayload(frame.payload)
+				return err
+			},
+		)
+		cancel()
+		if err == nil {
+			return res, nil
+		}
+		last = err
+		if errors.Is(err, errPeerClientClosed) {
+			return raft.InstallSnapshotResult{}, err
+		}
+		if ctx.Err() != nil {
+			return raft.InstallSnapshotResult{}, ctx.Err()
+		}
+		if attempts+1 < rpcAttempts {
+			if err := sleepWithContext(ctx, rpcRetryPause); err != nil {
+				return raft.InstallSnapshotResult{}, err
+			}
+		}
+	}
+	return raft.InstallSnapshotResult{}, last
+}
+
 const defaultPipelineRespBuffer = 64
 
 type pendingAppend struct {
@@ -892,6 +938,21 @@ func serveReplicationConnection(
 			if err := EncodeHeartbeatResult(conn, raft.HeartbeatResult{
 				Term: raftNode.Status().CurrentTerm,
 			}); err != nil {
+				return
+			}
+		case messageInstallSnapshot:
+			if raftNode == nil {
+				return
+			}
+			args, err := DecodeInstallSnapshotPayload(frame.payload)
+			if err != nil {
+				return
+			}
+			res, err := raftNode.HandleInstallSnapshot(args)
+			if err != nil {
+				return
+			}
+			if err := EncodeInstallSnapshotResult(conn, res); err != nil {
 				return
 			}
 		default:

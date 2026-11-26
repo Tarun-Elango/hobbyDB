@@ -81,7 +81,7 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 
 	for {
 		n.mu.Lock()
-		for n.LastApplied >= n.CommitIndex && ctx.Err() == nil {
+		for n.pendingSnap == nil && n.LastApplied >= n.CommitIndex && ctx.Err() == nil {
 			n.applyCond.Wait()
 		}
 		if ctx.Err() != nil {
@@ -89,8 +89,21 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 			return
 		}
 
+		if n.pendingSnap != nil {
+			ps := n.pendingSnap
+			if ps.index <= n.LastApplied {
+				n.pendingSnap = nil
+				n.mu.Unlock()
+				continue
+			}
+			n.mu.Unlock()
+			n.applyPendingSnapshot(ps)
+			continue
+		}
+
 		next := n.LastApplied + 1
-		if next == 0 || next > uint64(len(n.Log)) || n.Log[next-1].Index != next {
+		slice, ok := n.logSliceFromLocked(next)
+		if !ok || len(slice) == 0 || slice[0].Index != next {
 			// committed prefix is missing from this log; wait for a later update
 			if ctx.Err() != nil {
 				n.mu.Unlock()
@@ -100,9 +113,10 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 			n.mu.Unlock()
 			continue
 		}
+		lastIdx, _ := n.lastLogLocked()
 		end := n.CommitIndex
-		if end > uint64(len(n.Log)) {
-			end = uint64(len(n.Log))
+		if end > lastIdx {
+			end = lastIdx
 		}
 		applyLimit := uint64(proposeMaxBatchSize)
 		if applyLimit < 256 {
@@ -111,10 +125,11 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 		if end-next+1 > applyLimit {
 			end = next + applyLimit - 1
 		}
-		entries := make([]LogEntry, 0, int(end-next+1))
-		for idx := next; idx <= end; idx++ {
-			e := n.Log[idx-1]
-			if e.Index != idx {
+		count := int(end - next + 1)
+		entries := make([]LogEntry, 0, count)
+		for i := 0; i < count && i < len(slice); i++ {
+			e := slice[i]
+			if e.Index != next+uint64(i) {
 				break
 			}
 			entries = append(entries, cloneLogEntry(e))
@@ -131,7 +146,30 @@ func (n *Node) RunApply(ctx context.Context, apply func(proto.Command)) {
 			n.setLastAppliedLocked(lastApplied)
 		}
 		n.applyCond.Broadcast()
+
+		var (
+			startSnap bool
+			snapIdx   uint64
+			snapTerm  uint64
+			snapPath  string
+			sm        Snapshotter
+		)
+		if n.shouldSnapshotLocked() {
+			if term, ok := n.logTermAtLocked(n.LastApplied); ok {
+				n.snapInFlight = true
+				startSnap = true
+				snapIdx = n.LastApplied
+				snapTerm = term
+				snapPath = n.snapPath
+				sm = n.snapshotter
+			}
+		}
 		n.mu.Unlock()
+
+		if startSnap {
+			writeFn, closeFn := sm.BeginSnapshot()
+			go n.finishLocalSnapshot(snapIdx, snapTerm, snapPath, writeFn, closeFn)
+		}
 	}
 }
 

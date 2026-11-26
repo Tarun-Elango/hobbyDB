@@ -15,6 +15,8 @@ const (
 
 	messageRaftAppendEntries    byte = 7
 	messageRaftAppendEntriesRes byte = 8
+	messageInstallSnapshot      byte = 9
+	messageInstallSnapshotRes   byte = 10
 )
 
 // max message size

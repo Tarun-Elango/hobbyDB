@@ -243,11 +243,20 @@ func (p *serverProc) rssMB() float64 {
 }
 
 func (p *serverProc) walBytes() int64 {
-	st, err := os.Stat(p.walPath + "-raft.log")
+	entries, err := os.ReadDir(p.walPath + "-raft.log")
 	if err != nil {
 		return 0
 	}
-	return st.Size()
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".wal") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
 }
 
 // ---------------------------------------------------------------- client
@@ -297,17 +306,18 @@ func (c *client) close() { _ = c.conn.Close() }
 // re-created later. So a log with 1M records usually holds only `keys` live
 // entries; this is exactly the case where the WAL is much bigger than the DB.
 func seedWAL(dir string, records, keys, valSize int) (liveKeys int, err error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	walDir := filepath.Join(dir, "n1.wal-raft.log")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
 		return 0, err
 	}
-	f, err := os.Create(filepath.Join(dir, "n1.wal-raft.log"))
+	f, err := os.Create(filepath.Join(walDir, "00000000000000000001.wal"))
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
-	// Header is wal.walHeader ("KVWL" + version 2); kept private there.
-	if _, err := w.Write([]byte{'K', 'V', 'W', 'L', 2}); err != nil {
+	// Header is wal.walHeader ("KVWL" + version 3).
+	if _, err := w.Write([]byte{'K', 'V', 'W', 'L', 3}); err != nil {
 		return 0, err
 	}
 	if keys > records {

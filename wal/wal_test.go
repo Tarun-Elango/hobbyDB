@@ -129,22 +129,23 @@ func TestDecodeRecordChecksumMismatch(t *testing.T) {
 //
 
 func TestOpenCreatesFileAndDir(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "wal", "wal.log")
+	dir := filepath.Join(t.TempDir(), "nested", "wal")
 
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
 	defer log.Close()
 
-	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+	segFile := segmentPath(dir, 1)
+	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("expected dir to exist: %v", err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected file to exist: %v", err)
+	if _, err := os.Stat(segFile); err != nil {
+		t.Fatalf("expected segment file to exist: %v", err)
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(segFile)
 	if err != nil {
 		t.Fatalf("read WAL header: %v", err)
 	}
@@ -208,9 +209,10 @@ func TestAppendAndReplay(t *testing.T) {
 
 // test crash recovery
 func TestReplayTruncatesIncompleteRecord(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal.log")
+	dir := filepath.Join(t.TempDir(), "wal")
+	segFile := segmentPath(dir, 1)
 
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -224,7 +226,7 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 		t.Fatalf("close wal: %v", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(segFile, os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		t.Fatalf("open file for torn write: %v", err)
 	}
@@ -237,12 +239,12 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 		t.Fatalf("close torn writer: %v", err)
 	}
 
-	before, err := os.Stat(path)
+	before, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat before replay: %v", err)
 	}
 
-	log, err = Open(path)
+	log, err = Open(dir)
 	if err != nil {
 		t.Fatalf("reopen wal: %v", err)
 	}
@@ -257,7 +259,7 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	after, err := os.Stat(path)
+	after, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat after replay: %v", err)
 	}
@@ -268,7 +270,7 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 		t.Fatalf("replayed records = %#v, want only %#v", got, first)
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(segFile)
 	if err != nil {
 		t.Fatalf("read truncated wal: %v", err)
 	}
@@ -328,9 +330,9 @@ func TestReplayAppliesRecordsInOrder(t *testing.T) {
 }
 
 func TestCloseFlushesAndCloses(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal.log")
+	dir := filepath.Join(t.TempDir(), "wal")
 
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -352,7 +354,7 @@ func TestCloseFlushesAndCloses(t *testing.T) {
 	}
 
 	// read file after close - to check its present
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(segmentPath(dir, 1))
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
@@ -371,10 +373,10 @@ func TestCloseFlushesAndCloses(t *testing.T) {
 
 // check multiple goroutine can call append at same time
 func TestConcurrentAppend(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal.log")
+	dir := filepath.Join(t.TempDir(), "wal")
 
 	// open file
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -410,7 +412,7 @@ func TestConcurrentAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(segmentPath(dir, 1))
 	if err != nil {
 		t.Fatalf("read WAL: %v", err)
 	}
@@ -446,14 +448,17 @@ func TestConcurrentAppend(t *testing.T) {
 	}
 }
 
-// TestOpenRejectsLegacyWAL verifies that an unversioned WAL is rejected.
+// TestOpenRejectsLegacyWAL verifies that an unversioned or older-version segment is rejected.
 func TestOpenRejectsLegacyWAL(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.wal")
-	if err := os.WriteFile(path, []byte("legacy WAL"), 0600); err != nil {
+	dir := filepath.Join(t.TempDir(), "legacy")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segmentPath(dir, 1), []byte("legacy WAL"), 0600); err != nil {
 		t.Fatalf("write legacy WAL: %v", err)
 	}
 
-	_, err := Open(path)
+	_, err := Open(dir)
 	if !errors.Is(err, ErrUnsupportedFormat) {
 		t.Fatalf("Open() error = %v, want ErrUnsupportedFormat", err)
 	}
@@ -592,8 +597,9 @@ func TestTruncateFromReplacesSuffix(t *testing.T) {
 // payload is too short for its fields, is corruption. Replay must fail and
 // must not truncate it (or the valid records after it) as if it were a torn tail.
 func TestReplayRejectsMalformedRecordMidFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal.log")
-	log, err := Open(path)
+	dir := filepath.Join(t.TempDir(), "wal")
+	segFile := segmentPath(dir, 1)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open WAL: %v", err)
 	}
@@ -614,16 +620,16 @@ func TestReplayRejectsMalformedRecordMidFile(t *testing.T) {
 	if err := EncodeRecord(&good, Record{Index: 2, Op: byte(OpSet), Key: []byte("b")}); err != nil {
 		t.Fatalf("encode 2: %v", err)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f, err := os.OpenFile(segFile, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.Write(bad.Bytes())
 	f.Write(good.Bytes())
 	f.Close()
-	before, _ := os.ReadFile(path)
+	before, _ := os.ReadFile(segFile)
 
-	log, err = Open(path)
+	log, err = Open(dir)
 	if err != nil {
 		t.Fatalf("reopen WAL: %v", err)
 	}
@@ -632,7 +638,7 @@ func TestReplayRejectsMalformedRecordMidFile(t *testing.T) {
 	if !errors.Is(err, ErrMalformedRecord) {
 		t.Fatalf("Replay() error = %v, want ErrMalformedRecord", err)
 	}
-	after, _ := os.ReadFile(path)
+	after, _ := os.ReadFile(segFile)
 	if !bytes.Equal(before, after) {
 		t.Fatalf("WAL was modified: %d bytes before, %d after", len(before), len(after))
 	}
@@ -672,45 +678,6 @@ func TestDecodeRecordRejectsBadTrailer(t *testing.T) {
 	_ = writeUint32(&buf, crc32.ChecksumIEEE(payload.Bytes()))
 	if _, err := DecodeRecord(&buf); !errors.Is(err, ErrMalformedRecord) {
 		t.Fatalf("err = %v, want ErrMalformedRecord", err)
-	}
-}
-
-// A v2 file (header version 2, records without the client trailer) still
-// opens, replays, and accepts new records that carry client ids.
-func TestOpenReadsV2AndAppends(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "v2.wal")
-	var file bytes.Buffer
-	file.Write(walHeaderV2)
-	if err := EncodeRecord(&file, Record{Index: 1, Term: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, file.Bytes(), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	log, err := Open(path)
-	if err != nil {
-		t.Fatalf("open v2: %v", err)
-	}
-	if err := log.Replay(func(Record) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if err := log.Append(Record{Index: 2, Term: 1, Op: byte(OpSet), Key: []byte("b"), ClientID: 3, Seq: 1}); err != nil {
-		t.Fatal(err)
-	}
-	log.Close()
-
-	log, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer log.Close()
-	var got []Record
-	if err := log.Replay(func(r Record) error { got = append(got, r); return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0].ClientID != 0 || got[1].ClientID != 3 || got[1].Seq != 1 {
-		t.Fatalf("records = %+v", got)
 	}
 }
 
@@ -771,15 +738,16 @@ func TestAppendBatchAndReplay(t *testing.T) {
 }
 
 func TestAppendBatchEmptyNoop(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "empty-batch.wal")
+	dir := filepath.Join(t.TempDir(), "empty-batch")
+	segFile := segmentPath(dir, 1)
 
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
 	defer log.Close()
 
-	before, err := os.Stat(path)
+	before, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat before: %v", err)
 	}
@@ -791,7 +759,7 @@ func TestAppendBatchEmptyNoop(t *testing.T) {
 		t.Fatalf("AppendBatch(empty): %v", err)
 	}
 
-	after, err := os.Stat(path)
+	after, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat after: %v", err)
 	}
@@ -804,9 +772,10 @@ func TestAppendBatchEmptyNoop(t *testing.T) {
 }
 
 func TestAppendBatchRejectsInvalidWithoutPartialWrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "invalid-batch.wal")
+	dir := filepath.Join(t.TempDir(), "invalid-batch")
+	segFile := segmentPath(dir, 1)
 
-	log, err := Open(path)
+	log, err := Open(dir)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -816,7 +785,7 @@ func TestAppendBatchRejectsInvalidWithoutPartialWrite(t *testing.T) {
 		t.Fatalf("append initial: %v", err)
 	}
 
-	before, err := os.Stat(path)
+	before, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat before: %v", err)
 	}
@@ -830,7 +799,7 @@ func TestAppendBatchRejectsInvalidWithoutPartialWrite(t *testing.T) {
 		t.Fatalf("AppendBatch() error = %v, want ErrUnknownOp", err)
 	}
 
-	after, err := os.Stat(path)
+	after, err := os.Stat(segFile)
 	if err != nil {
 		t.Fatalf("stat after: %v", err)
 	}
@@ -844,7 +813,7 @@ func TestAppendBatchRejectsInvalidWithoutPartialWrite(t *testing.T) {
 		t.Fatalf("close wal: %v", err)
 	}
 
-	log, err = Open(path)
+	log, err = Open(dir)
 	if err != nil {
 		t.Fatalf("reopen wal: %v", err)
 	}

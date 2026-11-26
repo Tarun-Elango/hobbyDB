@@ -81,14 +81,60 @@ func (n *Node) logTermAtLocked(index uint64) (uint64, bool) {
 	if index == 0 {
 		return 0, true
 	}
-	if index > uint64(len(n.Log)) {
+	if index == n.SnapshotIndex {
+		return n.SnapshotTerm, true
+	}
+	if len(n.Log) == 0 {
 		return 0, false
 	}
-	entry := n.Log[index-1]
+	first := n.Log[0].Index
+	if index < first {
+		return 0, false
+	}
+	pos := index - first
+	if pos >= uint64(len(n.Log)) {
+		return 0, false
+	}
+	entry := n.Log[pos]
 	if entry.Index != index {
 		return 0, false
 	}
 	return entry.Term, true
+}
+
+func (n *Node) logSliceFromLocked(index uint64) ([]LogEntry, bool) {
+	if index == 0 || len(n.Log) == 0 {
+		return nil, false
+	}
+	first := n.Log[0].Index
+	if index < first {
+		return nil, false
+	}
+	pos := index - first
+	if pos >= uint64(len(n.Log)) {
+		return nil, false
+	}
+	return n.Log[pos:], true
+}
+
+// trimLogPrefixLocked drops all in-memory log entries with Index <= throughIndex
+// and copies the remaining tail into a fresh slice so GC can reclaim old entries.
+func (n *Node) trimLogPrefixLocked(throughIndex uint64) {
+	if len(n.Log) == 0 {
+		return
+	}
+	first := n.Log[0].Index
+	if throughIndex < first {
+		return
+	}
+	drop := throughIndex - first + 1
+	if drop >= uint64(len(n.Log)) {
+		n.Log = nil
+		return
+	}
+	tail := make([]LogEntry, len(n.Log)-int(drop))
+	copy(tail, n.Log[drop:])
+	n.Log = tail
 }
 
 func logEntryWireSize(entry LogEntry) int {
@@ -637,8 +683,35 @@ func (n *Node) replicatePeerPipeline(ctx context.Context, peer string, open Appe
 				if len(active) > 0 && activeBytes >= appendMaxInFlightBytes {
 					break
 				}
-				args, sendTerm, lastSent, wireBytes, ok := n.nextAppendAt(peer, sendNext)
-				if !ok {
+				args, sendTerm, lastSent, wireBytes, action := n.nextAppendAt(peer, sendNext)
+				if action == appendNeedSnapshot {
+					if n.getInstallSnapshotRPC() == nil {
+						break
+					}
+					// Drain/reset pipelined AppendEntries before streaming snapshot.
+					gen++
+					mode = modeProbe
+					active = active[:0]
+					activeBytes = 0
+					pipeline.Reset()
+
+					snapIdx, sentOK, steppedDown := n.sendSnapshotToPeer(ctx, peer, activeTerm)
+					if steppedDown {
+						resetPipelineState(0, 0)
+						break
+					}
+					if !sentOK {
+						backoffUntil = time.Now().Add(appendRetryBackoff)
+						break
+					}
+					sendNext = snapIdx + 1
+					sentCommit = snapIdx
+					sentTerm = activeTerm
+					mode = modeReplicate
+					continue
+				}
+				if action == appendNone {
+					var ok bool
 					knownCommit := knownCommitForTerm(sentCommit, sentTerm, active, activeTerm)
 					args, sendTerm, _, ok = n.nextCommitUpdate(peer, knownCommit, activeTerm)
 					if !ok {
@@ -766,28 +839,48 @@ func (n *Node) peerLeaderState(peer string) (Role, uint64, uint64) {
 	return n.Role, n.CurrentTerm, n.nextIndex[peer]
 }
 
-// build one AppendEntriesArgs for this peer starting at next; if caught up, return false
-func (n *Node) nextAppendAt(peer string, next uint64) (AppendEntriesArgs, uint64, uint64, int, bool) {
+type appendAction uint8
+
+const (
+	appendNone appendAction = iota
+	appendSend
+	appendNeedSnapshot
+)
+
+// build one AppendEntriesArgs for this peer starting at next; reports whether
+// the peer is caught up (appendNone) or requires InstallSnapshot (appendNeedSnapshot).
+func (n *Node) nextAppendAt(peer string, next uint64) (AppendEntriesArgs, uint64, uint64, int, appendAction) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
 	if n.Role != Leader {
-		return AppendEntriesArgs{}, 0, 0, 0, false
+		return AppendEntriesArgs{}, 0, 0, 0, appendNone
 	}
-	if next == 0 || next > uint64(len(n.Log)) {
-		return AppendEntriesArgs{}, 0, 0, 0, false
+	if next == 0 {
+		if n.SnapshotIndex > 0 {
+			return AppendEntriesArgs{}, n.CurrentTerm, 0, 0, appendNeedSnapshot
+		}
+		return AppendEntriesArgs{}, 0, 0, 0, appendNone
+	}
+	lastIdx, _ := n.lastLogLocked()
+	if next > lastIdx {
+		return AppendEntriesArgs{}, 0, 0, 0, appendNone
 	}
 
 	prevIndex := next - 1
 	prevTerm, ok := n.logTermAtLocked(prevIndex)
 	if !ok {
-		return AppendEntriesArgs{}, 0, 0, 0, false
+		return AppendEntriesArgs{}, n.CurrentTerm, 0, 0, appendNeedSnapshot
+	}
+	slice, ok := n.logSliceFromLocked(next)
+	if !ok || len(slice) == 0 {
+		return AppendEntriesArgs{}, n.CurrentTerm, 0, 0, appendNeedSnapshot
 	}
 
 	header := 8 + 2 + len(n.ID) + 8 + 8 + 8 + 4 // term, id len, id, prev index, prev term, leader commit, count
 	entries := make([]LogEntry, 0, appendEntriesBatchLimit)
 	size := header
-	for _, entry := range n.Log[next-1:] {
+	for _, entry := range slice {
 		entrySize := logEntryWireSize(entry)
 		if len(entries) > 0 && (len(entries) >= appendEntriesBatchLimit || size+entrySize > maxAppendEntriesPayload) {
 			break
@@ -796,7 +889,7 @@ func (n *Node) nextAppendAt(peer string, next uint64) (AppendEntriesArgs, uint64
 		size += entrySize
 	}
 	if len(entries) == 0 {
-		return AppendEntriesArgs{}, 0, 0, 0, false
+		return AppendEntriesArgs{}, 0, 0, 0, appendNone
 	}
 
 	lastSent := entries[len(entries)-1].Index
@@ -807,7 +900,7 @@ func (n *Node) nextAppendAt(peer string, next uint64) (AppendEntriesArgs, uint64
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
 		LeaderCommit: n.CommitIndex,
-	}, n.CurrentTerm, lastSent, size, true
+	}, n.CurrentTerm, lastSent, size, appendSend
 }
 
 // build one AppendEntriesArgs for this peer; if caught up, return false
@@ -815,8 +908,8 @@ func (n *Node) nextAppend(peer string) (AppendEntriesArgs, uint64, uint64, bool)
 	n.mu.RLock()
 	next := n.nextIndex[peer]
 	n.mu.RUnlock()
-	args, term, lastSent, _, ok := n.nextAppendAt(peer, next)
-	return args, term, lastSent, ok
+	args, term, lastSent, _, action := n.nextAppendAt(peer, next)
+	return args, term, lastSent, action == appendSend
 }
 
 // build an empty AppendEntries that only carries the leader's commit index.
@@ -914,9 +1007,12 @@ func (n *Node) advanceCommitLocked() {
 		return
 	}
 	prev := n.CommitIndex
-	for i := len(n.Log); i > int(n.CommitIndex); i-- {
-		entry := n.Log[i-1]
-		if entry.Index != uint64(i) || entry.Term != n.CurrentTerm {
+	for i := len(n.Log) - 1; i >= 0; i-- {
+		entry := n.Log[i]
+		if entry.Index <= n.CommitIndex {
+			break
+		}
+		if entry.Term != n.CurrentTerm {
 			continue
 		}
 		if n.copiesAtLocked(entry.Index) >= n.quorumLocked() {
@@ -976,28 +1072,61 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesResult,
 		n.pokeElectionTimer() // re-arm the timer a leader leaves stopped
 	}
 
-	prevTerm, ok := n.logTermAtLocked(args.PrevLogIndex)
-	if !ok || prevTerm != args.PrevLogTerm {
-		n.pokeElectionTimer()
-		return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
+	entries := args.Entries
+	if args.PrevLogIndex < n.SnapshotIndex {
+		// Stale or overlapping AppendEntries whose prefix is already covered by
+		// our committed snapshot. Never reject or truncate snapshotted entries.
+		if len(entries) == 0 {
+			n.advanceFollowerCommitLocked(args.LeaderCommit, args.PrevLogIndex)
+			n.pokeElectionTimer()
+			return AppendEntriesResult{Term: n.CurrentTerm, Success: true}, nil
+		}
+		lastEntry := entries[len(entries)-1]
+		if lastEntry.Index <= n.SnapshotIndex {
+			n.advanceFollowerCommitLocked(args.LeaderCommit, lastEntry.Index)
+			n.pokeElectionTimer()
+			return AppendEntriesResult{Term: n.CurrentTerm, Success: true}, nil
+		}
+		skip := n.SnapshotIndex - args.PrevLogIndex
+		if skip == 0 || skip > uint64(len(entries)) {
+			n.pokeElectionTimer()
+			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
+		}
+		snapEntry := entries[skip-1]
+		if snapEntry.Index != n.SnapshotIndex || snapEntry.Term != n.SnapshotTerm {
+			n.pokeElectionTimer()
+			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
+		}
+		entries = entries[skip:]
+	} else {
+		prevTerm, ok := n.logTermAtLocked(args.PrevLogIndex)
+		if !ok || prevTerm != args.PrevLogTerm {
+			n.pokeElectionTimer()
+			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
+		}
 	}
 
 	var toAppend []LogEntry
-	for _, entry := range args.Entries {
+	for _, entry := range entries {
+		if entry.Index <= n.SnapshotIndex {
+			continue
+		}
 		if len(toAppend) == 0 {
 			haveTerm, exists := n.logTermAtLocked(entry.Index)
 			if exists && haveTerm != entry.Term {
 				if err := n.persistTruncateLocked(entry.Index); err != nil {
 					return AppendEntriesResult{}, err
 				}
-				n.Log = n.Log[:entry.Index-1]
+				first := n.Log[0].Index
+				n.Log = n.Log[:entry.Index-first]
 				exists = false
 			}
 			if exists {
 				continue
 			}
 		}
-		if entry.Index != uint64(len(n.Log))+1+uint64(len(toAppend)) {
+		lastIdx, _ := n.lastLogLocked()
+		if entry.Index != lastIdx+1+uint64(len(toAppend)) {
 			return AppendEntriesResult{Term: n.CurrentTerm, Success: false}, nil
 		}
 		toAppend = append(toAppend, entry)

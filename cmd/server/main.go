@@ -33,6 +33,7 @@ type options struct {
 	walPath         string
 	peers           string
 	clientPeers     string
+	uiAddr          string
 	verbose         bool
 }
 
@@ -55,6 +56,7 @@ func run() error {
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
 	flag.StringVar(&opts.peers, "peers", "", "comma separated id=host:port pairs")
 	flag.StringVar(&opts.clientPeers, "client-peers", "", "comma separated id=clientHost:port pairs, used to redirect clients to the leader")
+	flag.StringVar(&opts.uiAddr, "ui-addr", "", "optional HTTP listen address for the cluster monitor UI (cmd/ui)")
 	flag.BoolVar(&opts.verbose, "verbose", false, "enable server logging output")
 	flag.Parse() // parse the cmd line arguments
 
@@ -115,6 +117,7 @@ func run() error {
 // - srv.Serve: block serving client requests until shutdown
 func runNode(ctx context.Context, opts options) error {
 	st := store.NewStore[string, []byte]()
+	sm := server.NewStateMachine(st)
 	logx.Printf("INFO: creating empty store for this node %s", opts.nodeID)
 
 	runCtx, cancel := context.WithCancel(ctx) // child context for the node, so we can cancel it if needed
@@ -124,8 +127,13 @@ func runNode(ctx context.Context, opts options) error {
 	if err != nil {
 		return fmt.Errorf("open raft node: %w", err)
 	}
-	// load the durable raft log; committed entries are re-applied to the store
-	// by RunApply once a leader (or its no-op) commits them
+	// load latest snapshot (if any) before opening the WAL so only post-snapshot
+	// log entries are replayed and kept in memory
+	if err := raftNode.OpenSnapshot(opts.walPath+"-raft.snap", sm); err != nil {
+		return err
+	}
+	// load the durable raft log; committed entries after the snapshot are
+	// re-applied to the store by RunApply once a leader (or its no-op) commits them
 	if err := raftNode.OpenLog(opts.walPath + "-raft.log"); err != nil {
 		return err
 	}
@@ -154,15 +162,23 @@ func runNode(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
-	go raftNode.Run(runCtx, peerSet.RequestVote)                         // run the election timer in its own goroutine
-	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)                 // run the heartbeat timer in its own goroutine
-	go raftNode.RunReplicationPipelined(runCtx, peerSet.AppendPipeline)  // pipeline leader log replication to peers
-	go raftNode.RunApply(runCtx, server.NewStateMachine(st).Apply)       // apply committed entries in order, each client write once
+	raftNode.SetInstallSnapshotRPC(peerSet.InstallSnapshot)
+	go raftNode.Run(runCtx, peerSet.RequestVote)                        // run the election timer in its own goroutine
+	go raftNode.RunHeartbeats(runCtx, peerSet.Heartbeat)                // run the heartbeat timer in its own goroutine
+	go raftNode.RunReplicationPipelined(runCtx, peerSet.AppendPipeline) // pipeline leader log replication to peers
+	go raftNode.RunApply(runCtx, sm.Apply)                              // apply committed entries in order, each client write once
 
 	srv := server.New(st, server.Config{
 		RaftNode:    raftNode,
 		ClientAddrs: clientAddrs,
 	})
+
+	// only allowed for ui, rest should use the custom tcp protocol
+	if opts.uiAddr != "" {
+		if err := startUIServer(runCtx, opts.uiAddr, opts.nodeID, raftNode, srv); err != nil {
+			return fmt.Errorf("start ui listener on %s: %w", opts.uiAddr, err)
+		}
+	}
 
 	peerErrCh := make(chan error, 1) // error channel for the peer server
 	go func() {
