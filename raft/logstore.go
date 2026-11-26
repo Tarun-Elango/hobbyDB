@@ -14,17 +14,22 @@ import (
 // it vote twice in one term (two leaders in that term), so startup stops.
 var ErrLogAheadOfState = errors.New("raft log is ahead of the persisted term")
 
-// OpenLog opens the durable raft log at path and loads every entry into memory.
-// Entries are not applied to the store here: whether they are committed is
-// only known once a leader says so.
-// Call it after OpenNode: it checks the log against the persisted term.
+// OpenLog opens the durable raft log at path and loads every entry after
+// SnapshotIndex into memory. Entries are not applied to the store here: whether
+// they are committed is only known once a leader says so.
+// Call it after OpenNode (and OpenSnapshot, if used): it checks the log against
+// the persisted term.
 func (n *Node) OpenLog(path string) error {
+	n.mu.RLock()
+	snapIndex := n.SnapshotIndex
+	n.mu.RUnlock()
+
 	log, err := wal.Open(path)
 	if err != nil {
 		return fmt.Errorf("open raft log: %w", err)
 	}
 	var entries []LogEntry
-	err = log.Replay(func(rec wal.Record) error {
+	err = log.ReplayAfter(snapIndex, func(rec wal.Record) error {
 		op, err := protoOp(rec.Op)
 		if err != nil {
 			return err
@@ -42,11 +47,11 @@ func (n *Node) OpenLog(path string) error {
 	}
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	// Terms only grow and every entry's term was the leader's current term,
 	// so a durable state file is always at or above the last entry's term.
 	if len(entries) > 0 {
 		if last := entries[len(entries)-1]; last.Term > n.CurrentTerm {
+			n.mu.Unlock()
 			_ = log.Close()
 			return fmt.Errorf(
 				"%w: log %s ends at index %d term %d, state file %s has term %d; "+
@@ -56,15 +61,28 @@ func (n *Node) OpenLog(path string) error {
 	}
 	n.logWAL = log
 	n.Log = entries
+	n.mu.Unlock()
+
+	// If a crash left stale WAL segments <= SnapshotIndex (e.g., right after
+	// InstallSnapshot renamed the snapshot file), clean them up now.
+	if snapIndex > 0 && len(entries) == 0 {
+		_ = log.ResetAfter(snapIndex)
+	}
 	return nil
 }
 
-// CloseLog flushes and closes the durable log.
+// CloseLog flushes and closes the durable log and cleans up any staged snapshot
+// receive file.
 func (n *Node) CloseLog() error {
 	n.mu.Lock()
 	log := n.logWAL
 	n.logWAL = nil
 	n.mu.Unlock()
+
+	n.snapRecvMu.Lock()
+	n.abortSnapshotRecvLocked()
+	n.snapRecvMu.Unlock()
+
 	if log == nil {
 		return nil
 	}

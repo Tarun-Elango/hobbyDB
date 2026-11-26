@@ -67,7 +67,9 @@ func TestRejoinCatchUp(t *testing.T) {
 			if wipe {
 				files, _ := filepath.Glob(c.nodes[f].wal + "*")
 				for _, p := range files {
-					_ = os.Remove(p)
+					if err := os.RemoveAll(p); err != nil {
+						t.Fatalf("wipe %s: %v", p, err)
+					}
 				}
 			}
 			res := writeLoad(c, writerConns, 3*time.Second)
@@ -168,14 +170,24 @@ func TestPartitionLeaderMinority(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	rejoin := time.Since(t1)
-	_, conv := waitConverged(c, 10*time.Second)
+	// waitConverged only checks key count, which is already equal because q was
+	// overwritten; poll until every node actually holds v3.
 	var finals []string
-	allV3 := true
-	for i := range c.nodes {
-		v := get(c, i, "q")
-		finals = append(finals, v)
-		allV3 = allV3 && v == "v3"
+	var allV3 bool
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		finals = make([]string, len(c.nodes))
+		allV3 = true
+		for i := range c.nodes {
+			v := get(c, i, "q")
+			finals[i] = v
+			allV3 = allV3 && v == "v3"
+		}
+		if allV3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	_, conv := waitConverged(c, 10*time.Second)
 	ok := old.s != "OK" && newW == "OK" && allV3 && conv
 	if !ok {
 		t.Errorf("old write=%s new write=%s finals=%v converged=%v", old.s, newW, finals, conv)

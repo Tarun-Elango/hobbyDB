@@ -313,3 +313,10 @@ func (s *Server) leaderTarget(leaderID string) string {
 	}
 	return leaderID
 }
+
+// Do runs one command exactly as if it had arrived on a client connection.
+// The monitor UI's HTTP listener (cmd/server -ui-addr) uses it; regular
+// clients keep using the binary TCP protocol.
+func (s *Server) Do(ctx context.Context, cmd proto.Command) (proto.Response, error) {
+	return s.dispatch(ctx, cmd)
+}

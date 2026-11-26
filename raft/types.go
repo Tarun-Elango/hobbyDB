@@ -43,9 +43,26 @@ type Node struct {
 	logWAL    *wal.Log // durable copy of Log; nil means the log is memory-only
 
 	// ---- all roles ----
-	Role        Role
-	CurrentTerm uint64
-	Log         []LogEntry
+	Role          Role
+	CurrentTerm   uint64
+	Log           []LogEntry
+	SnapshotIndex uint64 // last log index included in the latest snapshot (0 if none)
+	SnapshotTerm  uint64 // term of SnapshotIndex (0 if none)
+
+	// ---- snapshots + compaction ----
+	// Lock order: snapRecvMu -> mu -> metaMu -> snapFileMu.
+	// snapFileMu is a leaf lock held only for os.Open/os.Rename of snapPath.
+	snapPath             string
+	snapFileMu           sync.Mutex
+	snapRecvMu           sync.Mutex
+	snapRecv             *snapshotReceiver
+	snapInFlight         bool
+	pendingSnap          *pendingSnapshot
+	snapshotter          Snapshotter
+	installSnapRPC       InstallSnapshotRPC
+	snapThresholdEntries uint64
+	snapThresholdBytes   int64
+	snapTrailingLogs     uint64
 
 	// ---- follower + candidate (elections) ----
 	VotedFor      string
@@ -83,14 +100,16 @@ type Node struct {
 
 // read only copy, thread safe
 type Snapshot struct {
-	ID          string
-	Role        Role
-	CurrentTerm uint64
-	VotedFor    string
-	LeaderID    string
-	CommitIndex uint64
-	LastApplied uint64
-	Log         []LogEntry
+	ID            string
+	Role          Role
+	CurrentTerm   uint64
+	VotedFor      string
+	LeaderID      string
+	CommitIndex   uint64
+	LastApplied   uint64
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
+	Log           []LogEntry
 }
 
 // NodeStatus is a lightweight view of leadership and term metadata.
@@ -154,25 +173,30 @@ func (n *Node) Snapshot() Snapshot {
 	logCopy := append([]LogEntry(nil), n.Log...) // copies log entires to a new slice, change to orignal keep this unaffected
 
 	return Snapshot{
-		ID:          n.ID,
-		Role:        role,
-		CurrentTerm: term,
-		VotedFor:    n.VotedFor,
-		LeaderID:    leaderID,
-		CommitIndex: n.CommitIndex,
-		LastApplied: n.LastApplied,
-		Log:         logCopy,
+		ID:            n.ID,
+		Role:          role,
+		CurrentTerm:   term,
+		VotedFor:      n.VotedFor,
+		LeaderID:      leaderID,
+		CommitIndex:   n.CommitIndex,
+		LastApplied:   n.LastApplied,
+		SnapshotIndex: n.SnapshotIndex,
+		SnapshotTerm:  n.SnapshotTerm,
+		Log:           logCopy,
 	}
 
 }
 
 func NewNode(id string) *Node {
 	n := &Node{
-		ID:            id,
-		Role:          Follower,
-		Log:           make([]LogEntry, 0),
-		electionReset: make(chan struct{}, 1),
-		leaderWake:    make(chan struct{}, 1),
+		ID:                   id,
+		Role:                 Follower,
+		Log:                  make([]LogEntry, 0),
+		electionReset:        make(chan struct{}, 1),
+		leaderWake:           make(chan struct{}, 1),
+		snapThresholdEntries: jitterUint64(defaultSnapshotThresholdEntries),
+		snapThresholdBytes:   jitterInt64(defaultSnapshotThresholdBytes),
+		snapTrailingLogs:     defaultSnapshotTrailingLogs,
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n

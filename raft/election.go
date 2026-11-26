@@ -47,10 +47,10 @@ func randomElectionTimeout() time.Duration {
 	return electionTimeoutMin + time.Duration(rand.Int64N(int64(span)))
 }
 
-// get the last log index and term from the log
+// get the last log index and term from the log (falling back to the latest snapshot)
 func (n *Node) lastLogLocked() (index, term uint64) {
 	if len(n.Log) == 0 {
-		return 0, 0
+		return n.SnapshotIndex, n.SnapshotTerm
 	}
 	last := n.Log[len(n.Log)-1]
 	return last.Index, last.Term

@@ -11,4 +11,6 @@ const (
 
 	MessageRaftAppendEntries    byte = 7
 	MessageRaftAppendEntriesRes byte = 8
+	MessageInstallSnapshot      byte = 9
+	MessageInstallSnapshotRes   byte = 10
 )

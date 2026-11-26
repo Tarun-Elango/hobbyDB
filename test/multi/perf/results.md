@@ -96,3 +96,53 @@ Write-only run, then read-only run. `redirects` = NotLeader replies to writes, i
 | 2 | 175 | 44.3 / 72.1 / 84.0 | 0 | 0 |
 | 3 | 136 | 57.2 / 84.4 / 86.0 | 0 | 0 |
 
+-------------------
+
+# Performance, multi-node cluster
+
+2026-11-26 14:00 · darwin/arm64, 10 CPUs, go1.27.3 · all nodes on one machine (shared disk) · 3s per case · 128 B values · `server.read.from=any`
+
+Closed-loop clients, one request in flight per connection. Latency columns are p50 / p99 / p999 ms, client-side. Reads go to node `g % n`, writes to the leader.
+
+## Scaling with cluster size
+
+16 conns. Write-only run, then read-only run.
+
+| nodes | writes/s | write lat | redirects | reads/s | read lat | errors |
+|---|---|---|---|---|---|---|
+| 1 | 1298 | 12.0 / 25.0 / 28.0 | 0 | 149473 | 0.11 / 0.21 / 0.32 | 0 |
+| 3 | 430 | 36.2 / 59.4 / 60.0 | 0 | 163736 | 0.09 / 0.22 / 0.38 | 0 |
+| 5 | 348 | 45.1 / 74.1 / 81.1 | 0 | 157364 | 0.10 / 0.25 / 0.53 | 0 |
+
+## Mixed workload (5 nodes)
+
+32 conns, each picks GET or SET per op. A conn's next read waits for its previous write, so write latency caps the read rate.
+
+| read/write | total ops/s | reads/s | read lat | writes/s | write lat | redirects | errors |
+|---|---|---|---|---|---|---|---|
+| 90/10 | 6477 | 5850 | 0.14 / 0.93 / 1.61 | 627 | 48.5 / 78.5 / 82.9 | 0 | 0 |
+| 50/50 | 1224 | 614 | 0.19 / 0.86 / 11.5 | 610 | 48.3 / 93.5 / 105 | 0 | 0 |
+
+## Concurrency sweep (5 nodes)
+
+Write-only run, then read-only run. `redirects` = NotLeader replies to writes, i.e. the leader moved.
+
+| conns | writes/s | write lat | redirects | reads/s | read lat | errors |
+|---|---|---|---|---|---|---|
+| 1 | 68 | 15.6 / 23.8 / 24.0 | 0 | 77745 | 0.01 / 0.02 / 0.06 | 0 |
+| 8 | 177 | 44.1 / 75.9 / 87.2 | 0 | 119992 | 0.06 / 0.15 / 0.22 | 0 |
+| 16 | 328 | 48.5 / 74.0 / 83.8 | 0 | 157004 | 0.10 / 0.25 / 0.57 | 0 |
+| 32 | 582 | 52.2 / 97.8 / 99.8 | 0 | 181932 | 0.16 / 0.50 / 1.67 | 0 |
+| 64 | 1150 | 53.0 / 98.6 / 105 | 0 | 204370 | 0.28 / 1.05 / 2.87 | 0 |
+
+## Slow followers (5 nodes)
+
+8 writer conns. Each slow follower gets +10ms each way on its link to the leader (+20ms RTT). All peer links go through a test proxy.
+
+| slow followers | writes/s | write lat | redirects | errors |
+|---|---|---|---|---|
+| 0 | 184 | 42.6 / 68.1 / 71.5 | 0 | 0 |
+| 1 | 182 | 43.8 / 63.0 / 72.8 | 0 | 0 |
+| 2 | 175 | 46.4 / 64.0 / 70.9 | 0 | 0 |
+| 3 | 145 | 54.2 / 86.2 / 87.4 | 0 | 0 |
+

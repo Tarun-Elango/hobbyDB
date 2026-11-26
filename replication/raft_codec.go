@@ -403,3 +403,126 @@ func validateRaftAppendEntries(args raft.AppendEntriesArgs) error {
 	}
 	return nil
 }
+
+func EncodeInstallSnapshot(w io.Writer, args raft.InstallSnapshotArgs) error {
+	if args.LeaderID == "" || len(args.LeaderID) > maxLeaderIDLength {
+		return errors.New("replication: invalid leader ID length")
+	}
+	var payload bytes.Buffer
+	if err := writeU64(&payload, args.Term); err != nil {
+		return err
+	}
+	if err := writeU16(&payload, uint16(len(args.LeaderID))); err != nil {
+		return err
+	}
+	if err := writeFull(&payload, []byte(args.LeaderID)); err != nil {
+		return err
+	}
+	if err := writeU64(&payload, args.LastIncludedIndex); err != nil {
+		return err
+	}
+	if err := writeU64(&payload, args.LastIncludedTerm); err != nil {
+		return err
+	}
+	if err := writeU64(&payload, args.Offset); err != nil {
+		return err
+	}
+	done := byte(0)
+	if args.Done {
+		done = 1
+	}
+	if err := writeU8(&payload, done); err != nil {
+		return err
+	}
+	if err := writeU32(&payload, uint32(len(args.Data))); err != nil {
+		return err
+	}
+	if err := writeFull(&payload, args.Data); err != nil {
+		return err
+	}
+	if payload.Len() > maxAppendRequestPayload {
+		return fmt.Errorf("replication: install snapshot payload is %d bytes, max %d", payload.Len(), maxAppendRequestPayload)
+	}
+	return writeFrame(w, messageInstallSnapshot, payload.Bytes())
+}
+
+func DecodeInstallSnapshotPayload(payload []byte) (raft.InstallSnapshotArgs, error) {
+	r := bytes.NewReader(payload)
+	term, err := readU64(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	idLen, err := readU16(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	if idLen == 0 || int(idLen) > maxLeaderIDLength {
+		return raft.InstallSnapshotArgs{}, errors.New("replication: invalid leader ID length")
+	}
+	id, err := readBytes(r, uint32(idLen))
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	lastIdx, err := readU64(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	lastTerm, err := readU64(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	offset, err := readU64(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	done, err := readU8(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	if done > 1 {
+		return raft.InstallSnapshotArgs{}, fmt.Errorf("replication: invalid snapshot done byte %d", done)
+	}
+	dataLen, err := readU32(r)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	if int(dataLen) > maxAppendRequestPayload {
+		return raft.InstallSnapshotArgs{}, fmt.Errorf("replication: snapshot chunk too large: %d", dataLen)
+	}
+	data, err := readBytes(r, dataLen)
+	if err != nil {
+		return raft.InstallSnapshotArgs{}, err
+	}
+	if r.Len() != 0 {
+		return raft.InstallSnapshotArgs{}, errors.New("replication: trailing install snapshot bytes")
+	}
+	return raft.InstallSnapshotArgs{
+		Term:              term,
+		LeaderID:          string(id),
+		LastIncludedIndex: lastIdx,
+		LastIncludedTerm:  lastTerm,
+		Offset:            offset,
+		Data:              data,
+		Done:              done == 1,
+	}, nil
+}
+
+func EncodeInstallSnapshotResult(w io.Writer, result raft.InstallSnapshotResult) error {
+	var payload bytes.Buffer
+	if err := writeU64(&payload, result.Term); err != nil {
+		return err
+	}
+	return writeFrame(w, messageInstallSnapshotRes, payload.Bytes())
+}
+
+func DecodeInstallSnapshotResultPayload(payload []byte) (raft.InstallSnapshotResult, error) {
+	r := bytes.NewReader(payload)
+	term, err := readU64(r)
+	if err != nil {
+		return raft.InstallSnapshotResult{}, err
+	}
+	if r.Len() != 0 {
+		return raft.InstallSnapshotResult{}, errors.New("replication: trailing install snapshot result bytes")
+	}
+	return raft.InstallSnapshotResult{Term: term}, nil
+}

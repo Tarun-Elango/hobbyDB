@@ -4,13 +4,14 @@ and partitions.
 
 --------------------------------
 
-2	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
-3   pre vote -Adding Raft Pre-Vote would eliminate the 320 ms leader-change disruption seen when a minority partition heals.
+1   pre vote -Adding Raft Pre-Vote for handling leader-change disruption seen when a minority partition heals.
 
-5	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
-6.  check/add settings to tweak consitency / availability, and performance
-8.  Dispatch AppendEntries to followers in parallel with the leader's own WAL fsync, and only advance CommitIndex once a quorum (counting the leader only after its own fsync returns) has persisted.
-9	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast. - not dealing with it now 
+2	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
+3   check/add settings to tweak consitency / availability, and performance
+4   Dispatch AppendEntries to followers in parallel with the leader's own WAL fsync, and only advance CommitIndex once a quorum (counting the leader only after its own fsync returns) has persisted.
+5	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast. - not dealing with it now 
+
+6   code clean up 
 7.  update readme and docs and flow, check state machines
 
 

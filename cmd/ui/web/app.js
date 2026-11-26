@@ -1,11 +1,11 @@
 // kestrelKV cluster monitor: plain JS, no build step.
 //
-// Contract with the Go server (cmd/ui):
+// Contract with the Go server (cmd/ui, run with `go run ./cmd/ui`):
 //
 //   GET  /events                      Server-Sent Events
 //        event: state  data: {"connected":"n1","nodes":[{"id":"n1","addr":"127.0.0.1:9000",
 //                             "up":true,"role":"leader|follower|candidate|down",
-//                             "term":3,"leader":"n1"}]}
+//                             "term":3,"leader":"n1","proc":true,"cfg":{...node settings}}]}
 //        event: log    data: {"ts":1732190000000,"kind":"election|redirect|node|kv|error","msg":"..."}
 //
 //   POST /api/kv                      body {"op":"get|set|del|len|ping","key":"a","value":"b"}
@@ -33,6 +33,7 @@
 
   const cards = new Map(); // id -> card element
   const pending = new Set(); // node ids with an action in flight
+  const nodeErrs = new Map(); // id -> last failed action message, shown on the card
   let lastState = null;
   let logFilter = "all";
 
@@ -71,13 +72,16 @@
         cards.set(n.id, card);
         nodesEl.appendChild(card);
       }
+      const proc = n.proc ?? n.up; // process running (it may not answer yet)
       const role = n.up ? n.role || "follower" : "down";
       card.className = `node ${role}` +
         (n.id === state.connected ? " connected" : "") +
         (pending.has(n.id) ? " pending" : "");
-      $(".node-id", card).textContent = n.id;
+      // hexagon shows a short label: "node-a" -> "A"; ids without a dash stay as-is
+      $(".node-id", card).textContent = n.id.includes("-") ? n.id.split("-").pop().toUpperCase() : n.id;
+      $(".hex", card).title = n.id;
       $(".node-addr", card).textContent = n.addr || "";
-      $(".node-role", card).textContent = role.toUpperCase();
+      $(".node-role", card).textContent = !n.up && proc ? "NO REPLY" : role.toUpperCase();
       $(".v-term", card).textContent = n.up ? n.term ?? "—" : "—";
       const upEl = $(".v-up", card);
       upEl.textContent = n.up ? "ONLINE" : "OFFLINE";
@@ -85,8 +89,9 @@
       $(".v-leader", card).textContent = n.up ? n.leader || "?" : "—";
 
       const busy = pending.has(n.id);
-      $('[data-act="start"]', card).disabled = busy || n.up;
-      $('[data-act="kill"]', card).disabled = busy || !n.up;
+      $('[data-act="start"]', card).disabled = busy || proc;
+      $('[data-act="kill"]', card).disabled = busy || !proc;
+      $(".node-err", card).textContent = nodeErrs.get(n.id) || "";
       $('[data-act="restart"]', card).disabled = busy;
       $("[data-cfg]", card).disabled = busy;
     }
@@ -132,12 +137,17 @@
 
   async function nodeAction(id, act) {
     pending.add(id);
+    nodeErrs.delete(id);
     if (lastState) renderState(lastState);
+    const fail = (msg) => {
+      nodeErrs.set(id, `${act.toUpperCase()} FAILED · ${msg}`);
+      addLog({ ts: Date.now(), kind: "error", msg: `${act} ${id}: ${msg}` });
+    };
     try {
       const res = await api.node(id, act);
-      if (!res.ok) addLog({ ts: Date.now(), kind: "error", msg: `${act} ${id}: ${res.error || "failed"}` });
+      if (!res.ok) fail(res.error || "failed");
     } catch (e) {
-      addLog({ ts: Date.now(), kind: "error", msg: `${act} ${id}: ${e.message}` });
+      fail(e.message);
     } finally {
       pending.delete(id);
       if (lastState) renderState(lastState);
@@ -313,7 +323,7 @@
   function openNodeDialog(id) {
     editingId = id;
     const node = id && lastState?.nodes.find((n) => n.id === id);
-    const cfg = id ? nodeCfg.get(id) || defaultsFor(id, node?.addr) : suggestNew();
+    const cfg = id ? node?.cfg || nodeCfg.get(id) || defaultsFor(id, node?.addr) : suggestNew();
     for (const el of nodeForm.elements) {
       if (!el.name) continue;
       if (el.type === "checkbox") el.checked = !!cfg[el.name];
@@ -328,7 +338,8 @@
     $("#node-remove").hidden = !id;
     $("#node-dlg-note").textContent = id
       ? (node?.up ? `${id} restarts to apply new settings. Its Raft state is kept in the WAL.` : "")
-      : "The node starts as a follower and catches up from the leader.";
+      : useMock ? "The node starts as a follower and catches up from the leader."
+        : "Added stopped. Every node must be stopped to change membership; press START when ready.";
     $("#node-dlg-error").textContent = "";
     nodeDlg.showModal();
     (id ? nodeForm.elements.clientAddr : nodeForm.elements.id).focus();

@@ -1,24 +1,10 @@
 # kestrelKV
 
-Distributed key-value store with Raft consensus, durable WAL, and a custom binary TCP protocol for clients and peer replication.
+kestrelKV is a key-value store with a durable write-ahead log (WAL), snapshot-based log compaction, and a custom binary TCP protocol for clients and peer replication. It runs as a cluster that replicates every write with Raft consensus, so data survives node crashes and the cluster keeps serving requests as long as a majority of nodes are up — zero dependencies, pure Go standard library.
 
-Run the commands below by `cd`-ing into the paths shown (or from the repo root using `go run ./cmd/server` and `go run ./client`, noting that relative `-wal` paths resolve from your working directory). Use **three terminals** for the cluster, then a fourth for the client.
+## Start the servers
 
-## Cluster layout (3 nodes)
-
-| Node   | Node ID  | Client port | Replication port |
-|--------|----------|-------------|--------------------|
-| Node A | `node-a` | `:9000`     | `:9001`            |
-| Node B | `node-b` | `:9010`     | `:9002`            |
-| Node C | `node-c` | `:9020`     | `:9003`            |
-
-Raft elects the leader automatically. Pass every node's client address in `-client-peers` so a follower can hand the client that leader's address. The client follows that address, and if the leader dies it asks the remaining nodes and switches to the next leader.
-
-Server logging is off by default; the commands below pass `-verbose` to turn it on (drop it for a quiet node).
-
-Optional profiling: add `-pprof-addr=127.0.0.1:8080` (use a different port per process).
-
-## Run node A
+Start node A:
 
 ```bash
 cd cmd/server
@@ -32,33 +18,14 @@ go run . \
   -client-peers=node-b=127.0.0.1:9010,node-c=127.0.0.1:9020
 ```
 
-## Run node B
+To start nodes B and C, run the same command in another terminal and change these flags:
 
-```bash
-cd cmd/server
-go run . \
-  -node-id=node-b \
-  -verbose \
-  -client-addr=:9010 \
-  -replication-addr=:9002 \
-  -wal=data/node-b.wal \
-  -peers=node-a=127.0.0.1:9001,node-c=127.0.0.1:9003 \
-  -client-peers=node-a=127.0.0.1:9000,node-c=127.0.0.1:9020
-```
+- **Node B:** `-node-id=node-b`, `-client-addr=:9010`, `-replication-addr=:9002`, `-wal=data/node-b.wal`
+- **Node C:** `-node-id=node-c`, `-client-addr=:9020`, `-replication-addr=:9003`, `-wal=data/node-c.wal`
 
-## Run node C
+In `-peers` and `-client-peers`, list the other two nodes and leave out the node you are starting. Replication ports are A `9001`, B `9002`, C `9003`. Client ports are A `9000`, B `9010`, C `9020`.
 
-```bash
-cd cmd/server
-go run . \
-  -node-id=node-c \
-  -verbose \
-  -client-addr=:9020 \
-  -replication-addr=:9003 \
-  -wal=data/node-c.wal \
-  -peers=node-a=127.0.0.1:9001,node-b=127.0.0.1:9002 \
-  -client-peers=node-a=127.0.0.1:9000,node-b=127.0.0.1:9010
-```
+Raft elects the leader on its own. `-client-peers` lets a follower send the client to the leader, and if the leader dies the client moves to the new one. `-verbose` turns logging on. Add `-pprof-addr=127.0.0.1:8080` for profiling, with a different port for each node.
 
 ## Run client
 
@@ -71,27 +38,23 @@ go run . --9000 --9010 --9020
 
 Examples: `set foo bar`, `get foo`, `del foo`, `len`, `ping`, `quit`.
 
-## Compare Raft log (WAL) files
+## Run the client UI
 
-`-wal` is a file path prefix: each node writes its Raft log to `<wal>-raft.log` and persistent metadata (term/vote) to `<wal>-raft.state`.
-
-From `cmd/server` after writes (paths are per node):
+The UI is a web monitor that starts and manages the nodes for you, so you don't need the three server terminals. Run it from anywhere in the repo:
 
 ```bash
-cmp data/node-a.wal-raft.log data/node-b.wal-raft.log
-cmp data/node-a.wal-raft.log data/node-c.wal-raft.log
+go run ./cmd/ui
 ```
 
-No output from `cmp` means the files are identical.
+Then open http://127.0.0.1:8080. Use `-addr` to pick another address, or `-server-bin` to use a server binary you already built.
 
-## Inspect Raft log bytes
+This opens a UI where you can start, stop and restart nodes, add, edit and remove nodes, and run commands against the cluster.
 
-```bash
-xxd data/node-a.wal-raft.log | head
-xxd data/node-b.wal-raft.log | head
-xxd data/node-c.wal-raft.log | head
-```
+> **Note:** The UI uses HTTP, not the custom TCP protocol, because browsers can't open raw TCP connections. Don't use it for performance testing.
 
+![Cluster monitor UI](docs/images/cluster-monitor.png)
+
+<!--
 ## Install from a release
 
 The server and the client are installed separately, each with its own script. Both download a prebuilt binary from GitHub Releases (Linux or macOS, amd64/arm64) over HTTPS, verify its SHA-256 checksum, and install to `/usr/local/bin` (using `sudo` only if needed). Override the location with `BIN_DIR=...`.
@@ -134,6 +97,7 @@ To uninstall:
 ```bash
 kestrel-cli-uninstall
 ```
+-->
 
 ## Run all tests
 
@@ -149,3 +113,13 @@ KV_BENCH=1 go test -v -count=1 -p 1 -timeout 30m ./test/...
 - `-p 1` — runs one package at a time so cluster and perf suites don't compete for CPU/disk and skew results.
 - `-timeout 30m` — raises Go's default 10-minute per-package timeout for longer suites.
 - `./test/...` — runs every test package under `test/` (use `./test/multi/...` for multi-node suites only).
+
+## Important commands to know
+
+From `cmd/server`:
+
+```bash
+ls -l data/node-a.wal-raft.log data/node-a.wal-raft.snap                   # list segments and snapshot
+diff -r data/node-a.wal-raft.log data/node-b.wal-raft.log                  # compare two nodes' logs
+xxd data/node-a.wal-raft.log/00000000000000000001.wal | head               # inspect raw segment bytes
+```

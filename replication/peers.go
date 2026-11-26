@@ -105,3 +105,15 @@ func (p *PeerSet) Heartbeat(
 	}
 	return peer.control.Heartbeat(ctx, args)
 }
+
+func (p *PeerSet) InstallSnapshot(
+	ctx context.Context,
+	peerID string,
+	args raft.InstallSnapshotArgs,
+) (raft.InstallSnapshotResult, error) {
+	peer := p.peers[peerID]
+	if peer == nil {
+		return raft.InstallSnapshotResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
+	}
+	return peer.append.InstallSnapshot(ctx, args)
+}
