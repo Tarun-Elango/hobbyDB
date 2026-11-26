@@ -1,4 +1,4 @@
-hobbyDB: a Raft KV store in Go with higher write throughput and lower p99 than etcd on a 
+kestrelKV: a Raft KV store in Go with higher write throughput and lower p99 than etcd on a 
 3-node cluster. Same durability (fsync before ack), linearizable reads, checked under crashes
 and partitions.
 
@@ -7,13 +7,12 @@ and partitions.
 2	Snapshots and log compaction.	A 1M-record WAL means 1.1 GiB RSS and a 2 s restart. Without snapshots, long benchmark runs aren’t credible.
 3   pre vote -Adding Raft Pre-Vote would eliminate the 320 ms leader-change disruption seen when a minority partition heals.
 
-4	etcd head-to-head. Same machine, 3 nodes, 1–256 clients, 128 B / 4 KiB / 64 KiB values. Report writes/s and p50/p99/p999.	This is the result you publish.
 5	Add explicit transition methods for election and update flow diagrams accordingly.	Centralizes Raft role changes (Follower/Candidate/Leader) so side effects like applyCond.Broadcast() and election-timer resets can't be missed, and keeps flow/ docs in sync.
 6.  check/add settings to tweak consitency / availability, and performance
 8.  Dispatch AppendEntries to followers in parallel with the leader's own WAL fsync, and only advance CommitIndex once a quorum (counting the leader only after its own fsync returns) has persisted.
-7.  update readme and docs and flow
-8.  shard map
 9	Check-quorum step-down.	A leader cut off from the majority hangs writes for 5 s. It should fail fast. - not dealing with it now 
+7.  update readme and docs and flow, check state machines
+
 
 research ideas
 - CURP: 1-RTT Commutative Replication on Top of Raft

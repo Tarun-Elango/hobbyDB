@@ -2,7 +2,7 @@
 // subprocess per node, its own WAL dir): latency percentiles, scaling with
 // cluster size, mixed workloads, concurrency sweeps, and slow followers.
 //
-// Slow, so only runs with KV_BENCH=1. Each run overwrites results.md's tables.
+// Slow, so only runs with KV_BENCH=1. Each run appends to results.md.
 package perf
 
 import (
@@ -631,8 +631,7 @@ func record(title, note string, header, row []string) {
 	tb.rows = append(tb.rows, row)
 }
 
-// writeReport rewrites the generated tables and keeps any hand-written
-// section starting at "## Takeaways" from the previous results.md.
+// writeReport appends this run to results.md (separated by a divider line).
 func writeReport() {
 	reportMu.Lock()
 	defer reportMu.Unlock()
@@ -656,14 +655,23 @@ func writeReport() {
 		}
 		b.WriteString("\n")
 	}
-	if old, err := os.ReadFile(resultFile); err == nil {
-		if i := strings.Index(string(old), "## Takeaways"); i >= 0 {
-			b.WriteString(string(old[i:]))
-		}
-	}
-	if err := os.WriteFile(resultFile, []byte(b.String()), 0o644); err != nil {
+	if err := appendReport(resultFile, b.String()); err != nil {
 		fmt.Fprintln(os.Stderr, "write report:", err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nresults written to %s\n", resultFile)
+	fmt.Fprintf(os.Stderr, "\nresults appended to %s\n", resultFile)
+}
+
+func appendReport(path, report string) error {
+	old, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var out strings.Builder
+	if trimmed := bytes.TrimRight(old, "\r\n"); len(bytes.TrimSpace(trimmed)) > 0 {
+		out.Write(trimmed)
+		out.WriteString("\n\n-------------------\n\n")
+	}
+	out.WriteString(report)
+	return os.WriteFile(path, []byte(out.String()), 0o644)
 }
