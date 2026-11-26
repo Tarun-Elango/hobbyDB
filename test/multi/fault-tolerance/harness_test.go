@@ -3,7 +3,7 @@
 // what Raft promises: the cluster keeps serving with up to 2 of 5 nodes down,
 // refuses writes without a quorum, and never loses an acknowledged write.
 //
-// Slow, so only runs with KV_BENCH=1. Each run overwrites results.md.
+// Slow, so only runs with KV_BENCH=1. Each run appends to results.md.
 package faulttolerance
 
 import (
@@ -463,9 +463,23 @@ func writeReport() {
 		}
 		b.WriteString("\n")
 	}
-	if err := os.WriteFile(resultFile, []byte(b.String()), 0o644); err != nil {
+	if err := appendReport(resultFile, b.String()); err != nil {
 		fmt.Fprintln(os.Stderr, "write report:", err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nresults written to %s\n", resultFile)
+	fmt.Fprintf(os.Stderr, "\nresults appended to %s\n", resultFile)
+}
+
+func appendReport(path, report string) error {
+	old, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var out strings.Builder
+	if trimmed := bytes.TrimRight(old, "\r\n"); len(bytes.TrimSpace(trimmed)) > 0 {
+		out.Write(trimmed)
+		out.WriteString("\n\n-------------------\n\n")
+	}
+	out.WriteString(report)
+	return os.WriteFile(path, []byte(out.String()), 0o644)
 }

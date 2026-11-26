@@ -2,7 +2,7 @@
 // subprocess per node) and checks what clients can observe: linearizable
 // histories, no lost acked writes, and when reads go stale.
 //
-// Slow, so it only runs with KV_BENCH=1. Each run overwrites results.md:
+// Slow, so it only runs with KV_BENCH=1. Each run appends to results.md:
 //
 //	KV_BENCH=1 go test -v -count=1 ./test/multi/correctness/
 package correctness
@@ -409,9 +409,23 @@ func writeReport() {
 		}
 		b.WriteString("\n")
 	}
-	if err := os.WriteFile(resultFile, []byte(b.String()), 0o644); err != nil {
+	if err := appendReport(resultFile, b.String()); err != nil {
 		fmt.Fprintln(os.Stderr, "write report:", err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nresults written to %s\n", resultFile)
+	fmt.Fprintf(os.Stderr, "\nresults appended to %s\n", resultFile)
+}
+
+func appendReport(path, report string) error {
+	old, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var out strings.Builder
+	if trimmed := bytes.TrimRight(old, "\r\n"); len(bytes.TrimSpace(trimmed)) > 0 {
+		out.Write(trimmed)
+		out.WriteString("\n\n-------------------\n\n")
+	}
+	out.WriteString(report)
+	return os.WriteFile(path, []byte(out.String()), 0o644)
 }
