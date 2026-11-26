@@ -29,6 +29,14 @@ func (s *Store[K, V]) Get(key K) (V, bool) {
 	return v, ok
 }
 
+// GetBytes looks up a byte-slice key without allocating a string copy.
+func GetBytes[V any](s *Store[string, V], key []byte) (V, bool) {
+	s.mu.RLock()
+	v, ok := s.data[string(key)]
+	s.mu.RUnlock()
+	return v, ok
+}
+
 func (s *Store[K, V]) Set(key K, value V) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

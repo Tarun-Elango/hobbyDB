@@ -66,6 +66,28 @@ func TestGetSetDelete(t *testing.T) {
 
 }
 
+func TestGetBytes(t *testing.T) {
+	st := NewStore[string, []byte]()
+	st.Set("hello-world-key-exceeding-small-string-size", []byte("val"))
+
+	key := []byte("hello-world-key-exceeding-small-string-size")
+	v, ok := GetBytes(st, key)
+	if !ok || string(v) != "val" {
+		t.Fatalf("GetBytes got (%q, %v), want (%q, true)", v, ok, "val")
+	}
+
+	if _, ok := GetBytes(st, []byte("missing")); ok {
+		t.Fatalf("expected ok=false for missing key")
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		_, _ = GetBytes(st, key)
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs for GetBytes, got %v", allocs)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	st := NewStore[string, int]()
 
