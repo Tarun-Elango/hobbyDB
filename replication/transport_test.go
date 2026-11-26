@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"kvStore/proto"
 	"kvStore/raft"
 )
 
@@ -397,4 +399,257 @@ func TestRetrySleepRespectsContextCancellation(t *testing.T) {
 			t.Fatalf("RequestVote took %v after cancel", elapsed)
 		}
 	})
+}
+
+func TestTCPAppendPipelineFIFOOverSingleConnection(t *testing.T) {
+	const count = 6
+	var connCount atomic.Int32
+	allReceived := make(chan struct{})
+
+	addr := startFakePeerServer(t, func(conn net.Conn) {
+		connCount.Add(1)
+		received := make([]raft.AppendEntriesArgs, 0, count)
+		// Read ALL 6 frames BEFORE sending the first reply. This only succeeds
+		// if the client genuinely pipelines requests without waiting for replies.
+		for len(received) < count {
+			frame, err := readFrame(conn)
+			if err != nil {
+				return
+			}
+			if frame.messageType != messageRaftAppendEntries {
+				return
+			}
+			args, err := DecodeRaftAppendEntriesPayload(frame.payload)
+			if err != nil {
+				return
+			}
+			received = append(received, args)
+		}
+		close(allReceived)
+		for _, args := range received {
+			if err := EncodeRaftAppendEntriesResult(conn, raft.AppendEntriesResult{
+				Term:    args.Term,
+				Success: args.PrevLogIndex%2 == 0,
+			}); err != nil {
+				return
+			}
+		}
+	})
+
+	pipe := NewTCPAppendPipeline(addr)
+	defer pipe.Close()
+
+	ctx := context.Background()
+	for i := 0; i < count; i++ {
+		args := raft.AppendEntriesArgs{
+			Term:         uint64(10 + i),
+			LeaderID:     "leader",
+			PrevLogIndex: uint64(i),
+			PrevLogTerm:  1,
+		}
+		if err := pipe.Send(ctx, args, i); err != nil {
+			t.Fatalf("Send(%d): %v", i, err)
+		}
+	}
+
+	select {
+	case <-allReceived:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive all pipelined frames before replying")
+	}
+
+	for i := 0; i < count; i++ {
+		select {
+		case resp := <-pipe.Responses():
+			if resp.Err != nil {
+				t.Fatalf("resp %d err = %v", i, resp.Err)
+			}
+			if resp.Meta.(int) != i {
+				t.Fatalf("resp %d meta = %v, want %d (FIFO order)", i, resp.Meta, i)
+			}
+			wantTerm := uint64(10 + i)
+			wantSuccess := i%2 == 0
+			if resp.Res.Term != wantTerm || resp.Res.Success != wantSuccess {
+				t.Fatalf("resp %d = %+v, want Term=%d Success=%v", i, resp.Res, wantTerm, wantSuccess)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for resp %d", i)
+		}
+	}
+
+	if got := connCount.Load(); got != 1 {
+		t.Fatalf("TCP connection count = %d, want 1", got)
+	}
+}
+
+func TestTCPAppendPipelineDropFailsInFlightAndRedials(t *testing.T) {
+	const inFlightCount = 4
+	var connCount atomic.Int32
+
+	addr := startFakePeerServer(t, func(conn net.Conn) {
+		id := connCount.Add(1)
+		if id == 1 {
+			// Read all 4 pipelined frames then drop the TCP connection abruptly.
+			for i := 0; i < inFlightCount; i++ {
+				if _, err := readFrame(conn); err != nil {
+					return
+				}
+			}
+			_ = conn.Close()
+			return
+		}
+		// Second connection succeeds normally.
+		for {
+			frame, err := readFrame(conn)
+			if err != nil {
+				return
+			}
+			args, err := DecodeRaftAppendEntriesPayload(frame.payload)
+			if err != nil {
+				return
+			}
+			if err := EncodeRaftAppendEntriesResult(conn, raft.AppendEntriesResult{
+				Term:    args.Term,
+				Success: true,
+			}); err != nil {
+				return
+			}
+		}
+	})
+
+	pipe := NewTCPAppendPipeline(addr)
+	defer pipe.Close()
+
+	ctx := context.Background()
+	for i := 0; i < inFlightCount; i++ {
+		if err := pipe.Send(ctx, raft.AppendEntriesArgs{Term: 1, LeaderID: "leader"}, i); err != nil {
+			t.Fatalf("Send(%d): %v", i, err)
+		}
+	}
+
+	// All 4 in-flight sends must promptly fail in order without hanging.
+	for i := 0; i < inFlightCount; i++ {
+		select {
+		case resp := <-pipe.Responses():
+			if resp.Err == nil {
+				t.Fatalf("resp %d err = nil, want drop error", i)
+			}
+			if resp.Meta.(int) != i {
+				t.Fatalf("resp %d meta = %v, want %d", i, resp.Meta, i)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for error on in-flight %d", i)
+		}
+	}
+
+	// Next Send must transparently redial and succeed.
+	if err := pipe.Send(ctx, raft.AppendEntriesArgs{Term: 2, LeaderID: "leader"}, 99); err != nil {
+		t.Fatalf("Send after drop: %v", err)
+	}
+	select {
+	case resp := <-pipe.Responses():
+		if resp.Err != nil || !resp.Res.Success || resp.Res.Term != 2 || resp.Meta.(int) != 99 {
+			t.Fatalf("resp after redial = %+v, want Term=2 Success=true Meta=99", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reply after redial")
+	}
+	if got := connCount.Load(); got != 2 {
+		t.Fatalf("TCP connection count = %d, want 2", got)
+	}
+
+	if err := pipe.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := pipe.Send(ctx, raft.AppendEntriesArgs{Term: 2, LeaderID: "leader"}, 100); !errors.Is(err, errPeerClientClosed) {
+		t.Fatalf("Send after Close err = %v, want errPeerClientClosed", err)
+	}
+}
+
+func TestPeerSetPipelinedReplicationEndToEnd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dir := t.TempDir()
+	follower, err := raft.OpenNode("b", filepath.Join(dir, "b.state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewReplicationServer(ctx, "127.0.0.1:0", follower)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	go srv.Serve()
+
+	peerSet, err := NewPeerSet([]string{"b=" + srv.listener.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerSet.Close()
+
+	leader, err := raft.OpenNode("a", filepath.Join(dir, "a.state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.SetPeers([]string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	// Elect leader via Run so nextIndex/matchIndex and the term no-op are initialized normally.
+	electCtx, electCancel := context.WithCancel(ctx)
+	go leader.Run(electCtx, func(ctx context.Context, peerID string, args raft.RequestVoteArgs) (raft.RequestVoteResult, error) {
+		return raft.RequestVoteResult{Term: args.Term, VoteGranted: true}, nil
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if leader.Status().Role == raft.Leader {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	electCancel()
+	if leader.Status().Role != raft.Leader {
+		t.Fatal("leader did not become leader")
+	}
+
+	go leader.RunReplicationPipelined(ctx, peerSet.AppendPipeline)
+	go leader.RunApply(ctx, func(proto.Command) {})
+
+	const totalWrites = 150
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalWrites)
+	for i := 0; i < totalWrites; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+			defer pcancel()
+			_, err := leader.Propose(pctx, proto.Command{
+				Op:    proto.OpSet,
+				Key:   []byte("key"),
+				Value: []byte("val"),
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("Propose failed: %v", err)
+	}
+
+	// +1 for leader no-op entry appended on becomeLeader.
+	wantLen := totalWrites + 1
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s := follower.Snapshot()
+		if len(s.Log) == wantLen && s.CommitIndex == uint64(wantLen) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s := follower.Snapshot()
+	t.Fatalf("follower log len=%d commit=%d, want %d", len(s.Log), s.CommitIndex, wantLen)
 }

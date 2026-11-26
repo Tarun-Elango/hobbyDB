@@ -3,6 +3,7 @@ package replication
 // Peer TCP transport for Raft RPCs (RequestVote, AppendEntries, heartbeat).
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -29,7 +30,10 @@ const (
 	heartbeatRetryPause = 5 * time.Millisecond
 )
 
-var errPeerClientClosed = errors.New("replication: peer client is closed")
+var (
+	errPeerClientClosed = errors.New("replication: peer client is closed")
+	errPipelineReset    = errors.New("replication: append pipeline reset")
+)
 
 type TCPPeerClient struct {
 	addr string
@@ -307,6 +311,352 @@ func (c *TCPPeerClient) AppendEntries(
 		}
 	}
 	return raft.AppendEntriesResult{}, last
+}
+
+const defaultPipelineRespBuffer = 64
+
+type pendingAppend struct {
+	meta     any
+	deadline time.Time
+}
+
+type tcpAppendConn struct {
+	conn      net.Conn
+	wake      chan struct{}
+	queue     []pendingAppend
+	broken    bool
+	failErr   error
+	closeOnce sync.Once
+}
+
+func (tc *tcpAppendConn) close() {
+	tc.closeOnce.Do(func() {
+		_ = tc.conn.Close()
+	})
+}
+
+func (tc *tcpAppendConn) signalWake() {
+	select {
+	case tc.wake <- struct{}{}:
+	default:
+	}
+}
+
+// TCPAppendPipeline pipelines AppendEntries frames over a single persistent TCP
+// connection so the follower processes batches in strict FIFO order while
+// overlapping network RTT with follower disk fsyncs.
+type TCPAppendPipeline struct {
+	addr    string
+	respCh  chan raft.AppendPipelineResponse
+	closeCh chan struct{}
+
+	// Lock order: writeMu -> mu. readLoop, Reset, and Close only acquire mu.
+	writeMu sync.Mutex
+	mu      sync.Mutex
+	active  *tcpAppendConn
+	closed  bool
+}
+
+func NewTCPAppendPipeline(addr string) *TCPAppendPipeline {
+	return &TCPAppendPipeline{
+		addr:    addr,
+		respCh:  make(chan raft.AppendPipelineResponse, defaultPipelineRespBuffer),
+		closeCh: make(chan struct{}),
+	}
+}
+
+func (p *TCPAppendPipeline) Responses() <-chan raft.AppendPipelineResponse {
+	return p.respCh
+}
+
+// Send encodes and writes args onto the peer's single TCP connection in exact
+// call order without waiting for the follower's reply. If Send returns nil,
+// exactly one AppendPipelineResponse for meta will arrive on Responses()
+// (unless Close is called).
+func (p *TCPAppendPipeline) Send(ctx context.Context, args raft.AppendEntriesArgs, meta any) error {
+	if p == nil {
+		return errors.New("replication: nil TCP append pipeline")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var frameBuf bytes.Buffer
+	if err := EncodeRaftAppendEntries(&frameBuf, args); err != nil {
+		return err
+	}
+	frameBytes := frameBuf.Bytes()
+
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	tc, err := p.ensureConn(ctx)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errPeerClientClosed
+	}
+	if p.active != tc || tc.broken {
+		// Connection broke between ensureConn and enqueue; dial once fresh.
+		p.mu.Unlock()
+		tc, err = p.ensureConn(ctx)
+		if err != nil {
+			return err
+		}
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return errPeerClientClosed
+		}
+		if p.active != tc || tc.broken {
+			p.mu.Unlock()
+			return errPipelineReset
+		}
+	}
+	tc.queue = append(tc.queue, pendingAppend{
+		meta:     meta,
+		deadline: time.Now().Add(appendAttemptTimeout),
+	})
+	tc.signalWake()
+	p.mu.Unlock()
+
+	// From here on, readLoop owns the queued entry and guarantees a response or
+	// error on respCh.
+	stopCancel := context.AfterFunc(ctx, tc.close)
+	defer stopCancel()
+
+	if err := tc.conn.SetWriteDeadline(time.Now().Add(appendAttemptTimeout)); err != nil {
+		p.failConn(tc, err)
+		return nil
+	}
+	if err := writeFull(tc.conn, frameBytes); err != nil {
+		if ctx.Err() != nil {
+			p.failConn(tc, ctx.Err())
+		} else {
+			p.failConn(tc, fmt.Errorf("replication: write to %s: %w", p.addr, err))
+		}
+	}
+	return nil
+}
+
+func (p *TCPAppendPipeline) ensureConn(ctx context.Context) (*tcpAppendConn, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errPeerClientClosed
+	}
+	if p.active != nil && !p.active.broken {
+		tc := p.active
+		p.mu.Unlock()
+		return tc, nil
+	}
+	p.mu.Unlock()
+
+	dialCtx, cancel := context.WithTimeout(ctx, appendAttemptTimeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", p.addr)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("replication: dial follower %s: %w", p.addr, err)
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		_ = conn.Close()
+		return nil, errPeerClientClosed
+	}
+	if p.active != nil && !p.active.broken {
+		tc := p.active
+		p.mu.Unlock()
+		_ = conn.Close()
+		return tc, nil
+	}
+	tc := &tcpAppendConn{
+		conn: conn,
+		wake: make(chan struct{}, 1),
+	}
+	p.active = tc
+	p.mu.Unlock()
+
+	go p.readLoop(tc)
+	return tc, nil
+}
+
+func (p *TCPAppendPipeline) failConn(tc *tcpAppendConn, err error) {
+	p.mu.Lock()
+	if !tc.broken {
+		tc.broken = true
+		tc.failErr = err
+	}
+	if p.active == tc {
+		p.active = nil
+	}
+	tc.signalWake()
+	p.mu.Unlock()
+	tc.close()
+}
+
+func (p *TCPAppendPipeline) deliver(resp raft.AppendPipelineResponse) bool {
+	select {
+	case p.respCh <- resp:
+		return true
+	case <-p.closeCh:
+		return false
+	}
+}
+
+func (p *TCPAppendPipeline) readLoop(tc *tcpAppendConn) {
+	defer tc.close()
+
+	for {
+		p.mu.Lock()
+		for len(tc.queue) == 0 && !tc.broken && !p.closed {
+			p.mu.Unlock()
+			select {
+			case <-tc.wake:
+			case <-p.closeCh:
+				return
+			}
+			p.mu.Lock()
+		}
+		if tc.broken || p.closed {
+			remaining := tc.queue
+			tc.queue = nil
+			failErr := tc.failErr
+			if p.active == tc {
+				p.active = nil
+			}
+			p.mu.Unlock()
+			if failErr == nil {
+				if p.isClosed() {
+					failErr = errPeerClientClosed
+				} else {
+					failErr = errPipelineReset
+				}
+			}
+			for _, item := range remaining {
+				if !p.deliver(raft.AppendPipelineResponse{Meta: item.meta, Err: failErr}) {
+					return
+				}
+			}
+			return
+		}
+		item := tc.queue[0]
+		tc.queue = tc.queue[1:]
+		p.mu.Unlock()
+
+		var (
+			res raft.AppendEntriesResult
+			err error
+		)
+		if err = tc.conn.SetReadDeadline(item.deadline); err == nil {
+			var frame replicationFrame
+			frame, err = readFrame(tc.conn)
+			if err == nil {
+				if frame.messageType != messageRaftAppendEntriesRes {
+					err = fmt.Errorf("replication: unexpected frame type: %d", frame.messageType)
+				} else {
+					res, err = DecodeRaftAppendEntriesResultPayload(frame.payload)
+				}
+			} else {
+				err = fmt.Errorf("replication: read from %s: %w", p.addr, err)
+			}
+		}
+
+		if err != nil {
+			p.mu.Lock()
+			if !tc.broken {
+				tc.broken = true
+				tc.failErr = err
+			}
+			failErr := tc.failErr
+			remaining := tc.queue
+			tc.queue = nil
+			if p.active == tc {
+				p.active = nil
+			}
+			p.mu.Unlock()
+			tc.close()
+
+			if !p.deliver(raft.AppendPipelineResponse{Meta: item.meta, Err: failErr}) {
+				return
+			}
+			for _, rem := range remaining {
+				if !p.deliver(raft.AppendPipelineResponse{Meta: rem.meta, Err: failErr}) {
+					return
+				}
+			}
+			return
+		}
+
+		if !p.deliver(raft.AppendPipelineResponse{Meta: item.meta, Res: res}) {
+			return
+		}
+	}
+}
+
+func (p *TCPAppendPipeline) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
+}
+
+// Reset closes the current TCP connection (if any) and fails any in-flight
+// requests on it so the next Send dials fresh.
+func (p *TCPAppendPipeline) Reset() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	tc := p.active
+	if tc != nil {
+		if !tc.broken {
+			tc.broken = true
+			tc.failErr = errPipelineReset
+		}
+		p.active = nil
+		tc.signalWake()
+	}
+	p.mu.Unlock()
+	if tc != nil {
+		tc.close()
+	}
+}
+
+// Close permanently shuts down the pipeline and its TCP connection.
+func (p *TCPAppendPipeline) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	close(p.closeCh)
+	tc := p.active
+	if tc != nil {
+		tc.broken = true
+		tc.failErr = errPeerClientClosed
+		p.active = nil
+		tc.signalWake()
+	}
+	p.mu.Unlock()
+	if tc != nil {
+		tc.close()
+	}
+	return nil
 }
 
 // replication server owns replication listener and all peer connections

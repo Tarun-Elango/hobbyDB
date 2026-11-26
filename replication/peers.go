@@ -8,8 +8,9 @@ import (
 )
 
 type peerClients struct {
-	control *TCPPeerClient // Heartbeat and RequestVote
-	append  *TCPPeerClient // AppendEntries
+	control  *TCPPeerClient     // Heartbeat and RequestVote
+	append   *TCPPeerClient     // single-RPC AppendEntries
+	pipeline *TCPAppendPipeline // pipelined FIFO AppendEntries stream
 }
 
 type PeerSet struct {
@@ -30,8 +31,9 @@ func NewPeerSet(specs []string) (*PeerSet, error) {
 		}
 		set.ids = append(set.ids, id)
 		set.peers[id] = &peerClients{
-			control: NewTCPPeerClient(addr),
-			append:  NewTCPPeerClient(addr),
+			control:  NewTCPPeerClient(addr),
+			append:   NewTCPPeerClient(addr),
+			pipeline: NewTCPAppendPipeline(addr),
 		}
 	}
 	return set, nil
@@ -51,6 +53,9 @@ func (p *PeerSet) Close() error {
 			err = e
 		}
 		if e := peer.append.Close(); e != nil {
+			err = e
+		}
+		if e := peer.pipeline.Close(); e != nil {
 			err = e
 		}
 	}
@@ -79,6 +84,14 @@ func (p *PeerSet) AppendEntries(
 		return raft.AppendEntriesResult{}, fmt.Errorf("replication: unknown peer %s", peerID)
 	}
 	return peer.append.AppendEntries(ctx, args)
+}
+
+func (p *PeerSet) AppendPipeline(peerID string) (raft.AppendPipeline, error) {
+	peer := p.peers[peerID]
+	if peer == nil {
+		return nil, fmt.Errorf("replication: unknown peer %s", peerID)
+	}
+	return peer.pipeline, nil
 }
 
 func (p *PeerSet) Heartbeat(
