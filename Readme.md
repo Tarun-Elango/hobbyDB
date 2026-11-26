@@ -2,7 +2,7 @@
 
 Distributed key-value store with Raft consensus, durable WAL, and a custom binary TCP protocol for clients and peer replication.
 
-Run all server commands from the repo root (or `cd` into the paths shown). Use **three terminals** for the cluster, then a fourth for the client.
+Run the commands below by `cd`-ing into the paths shown (or from the repo root using `go run ./cmd/server` and `go run ./client`, noting that relative `-wal` paths resolve from your working directory). Use **three terminals** for the cluster, then a fourth for the client.
 
 ## Cluster layout (3 nodes)
 
@@ -32,7 +32,7 @@ go run . \
   -client-peers=node-b=127.0.0.1:9010,node-c=127.0.0.1:9020
 ```
 
-## Run node B (follower until elected)
+## Run node B
 
 ```bash
 cd cmd/server
@@ -46,7 +46,7 @@ go run . \
   -client-peers=node-a=127.0.0.1:9000,node-c=127.0.0.1:9020
 ```
 
-## Run node C (follower until elected)
+## Run node C
 
 ```bash
 cd cmd/server
@@ -71,30 +71,32 @@ go run . --9000 --9010 --9020
 
 Examples: `set foo bar`, `get foo`, `del foo`, `len`, `ping`, `quit`.
 
-## Compare WAL files
+## Compare Raft log (WAL) files
+
+`-wal` is a file path prefix: each node writes its Raft log to `<wal>-raft.log` and persistent metadata (term/vote) to `<wal>-raft.state`.
 
 From `cmd/server` after writes (paths are per node):
 
 ```bash
-cmp data/node-a.wal data/node-b.wal
-cmp data/node-a.wal data/node-c.wal
+cmp data/node-a.wal-raft.log data/node-b.wal-raft.log
+cmp data/node-a.wal-raft.log data/node-c.wal-raft.log
 ```
 
 No output from `cmp` means the files are identical.
 
-## Inspect WAL bytes
+## Inspect Raft log bytes
 
 ```bash
-xxd data/node-a.wal | head
-xxd data/node-b.wal | head
-xxd data/node-c.wal | head
+xxd data/node-a.wal-raft.log | head
+xxd data/node-b.wal-raft.log | head
+xxd data/node-c.wal-raft.log | head
 ```
-
-Raft persistent metadata (term/vote) is stored separately, e.g. `data/node-a.wal-raft.state`.
 
 ## Install from a release
 
 The server and the client are installed separately, each with its own script. Both download a prebuilt binary from GitHub Releases (Linux or macOS, amd64/arm64) over HTTPS, verify its SHA-256 checksum, and install to `/usr/local/bin` (using `sudo` only if needed). Override the location with `BIN_DIR=...`.
+
+Both `kestrel` and `kestrel-cli` require `settings.properties` at startup (there are no built-in defaults). When running outside this repository, either point `KVSTORE_SETTINGS=/path/to/settings.properties` at a copy of the file or place `settings.properties` in your working directory (or alongside the binary).
 
 ### Server
 
