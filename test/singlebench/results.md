@@ -179,3 +179,64 @@ Closed loop: a connection's next GET waits for its previous write, so write late
 | 95/5 | 51913 | 49283 | 2629 | 0.11 / 0.28 | 9.55 / 21.3 |
 | 50/50 | 5225 | 2617 | 2608 | 0.23 / 0.92 | 11.6 / 24.0 |
 
+-------------------
+
+# Single-node benchmark
+
+2026-11-26 16:53 · darwin/arm64, 10 CPUs, go1.27.3 · 3s per throughput case
+
+One `cmd/server` node over TCP; every write is an fsync'd Raft-log append. Latencies are client-side.
+
+## Summary
+
+| metric | result |
+|---|---|
+| Write, 1 conn (per-op fsync cost) | 232 ops/s, p50 / p99 3.99 / 8.21 ms |
+| Write, 64 conns (concurrency scaling) | 4951 ops/s, p50 / p99 12.2 / 24.9 ms |
+| Write bandwidth, 64 KiB values | 97.1 MiB/s |
+| Read, 32 conns, no writers | 192961 ops/s, p50 / p99 0.16 / 0.35 ms |
+| Read, 32 conns, 16 writers active | 198996 ops/s, p50 / p99 0.15 / 0.33 ms |
+| Mixed 95/5, 32 conns | 50417 ops/s |
+| Restart -> ready, 1000000-record WAL | 1974 ms, RSS 523 MiB |
+
+## Startup vs WAL length
+
+Median of 3 restarts. `listen` = WAL replayed, port open. `ready` = first write acked (adds the 150-300 ms election + re-apply). Churned log: live keys << records.
+
+| WAL records | WAL MiB | live keys | listen ms | ready ms | RSS MiB |
+|---|---|---|---|---|---|
+| 0 | 0.0 | 0 | 12.5 | 261 | 9 |
+| 100000 | 16.5 | 100000 | 150 | 479 | 76 |
+| 1000000 | 155.0 | 91008 | 1467 | 1974 | 523 |
+
+## Writes (SET/DEL 95/5)
+
+Synchronous clients, one request in flight per connection. MiB/s = SET value bytes.
+
+| value | conns | ops/s | MiB/s | p50 / p99 ms |
+|---|---|---|---|---|
+| 128 B | 1 | 232 | 0.03 | 3.99 / 8.21 |
+| 128 B | 16 | 1434 | 0.17 | 11.0 / 23.1 |
+| 128 B | 64 | 4951 | 0.57 | 12.2 / 24.9 |
+| 4 KiB | 16 | 2041 | 7.60 | 7.35 / 16.3 |
+| 64 KiB | 16 | 1637 | 97.07 | 8.97 / 22.1 |
+
+## Reads under write load (128 B, 32 reader conns)
+
+Readers only GET, writers only SET/DEL, separate connections, same keyspace, at the same time.
+
+| writer conns | reads/s | read p50 / p99 ms | writes/s | write p50 / p99 ms |
+|---|---|---|---|---|
+| 0 | 192961 | 0.16 / 0.35 | - | - |
+| 1 | 196917 | 0.16 / 0.32 | 266 | 3.86 / 7.09 |
+| 16 | 198996 | 0.15 / 0.33 | 1690 | 9.24 / 19.1 |
+
+## Mixed (128 B, 32 conns, GET + SET/DEL on each conn)
+
+Closed loop: a connection's next GET waits for its previous write, so write latency caps total ops/s.
+
+| read/write | total ops/s | reads/s | writes/s | read p50 / p99 ms | write p50 / p99 ms |
+|---|---|---|---|---|---|
+| 95/5 | 50417 | 47863 | 2554 | 0.12 / 0.28 | 9.76 / 20.6 |
+| 50/50 | 5325 | 2664 | 2662 | 0.25 / 0.74 | 11.6 / 25.6 |
+
